@@ -1,0 +1,22 @@
+[project]
+name = "agent-parliament"
+version = "0.1.0"
+description = "一个 MCP 服务：让主Agent在必要时调用多个国内外模型做调研、代码审查、独立分析与多模型共识，所有副Agent均以只读模式运行。"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+]
+
+[project.scripts]
+agent-parliament = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# 本项目是单文件模块，显式告诉hatchling把这两个模块作为打包内容，避免它按包目录结构去猜
+[tool.hatch.build.targets.wheel]
+include = [
+    "server.py",
+    "runner.py",
+]

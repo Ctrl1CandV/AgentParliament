@@ -1,0 +1,26 @@
+{
+  "_readme": "模型与角色配置，token为敏感信息，请勿提交到git。models定义每个模型的Anthropic兼容端点；roles定义每个角色的失败链。",
+
+  "defaults": {
+    "timeout_seconds": 300
+  },
+
+  "models": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/anthropic",
+      "token": "<在此填入 DeepSeek 的 API Key>",
+      "model": "deepseek-chat"
+    },
+    "glm": {
+      "base_url": "<在此填入 GLM 兼容端点，例如火山方舟 coding plan 的 base_url>",
+      "token": "<在此填入 GLM 对应渠道的 API Key>",
+      "model": "glm-5.1"
+    }
+  },
+
+  "roles": {
+    "researcher": ["deepseek"],
+    "third_party": ["glm", "deepseek"],
+    "reviewer": ["deepseek"]
+  }
+}
