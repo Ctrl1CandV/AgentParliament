@@ -13,3 +13,5 @@ Thumbs.db
 
 logs/
 *.log
+
+sandbox/
