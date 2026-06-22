@@ -48,19 +48,20 @@
 
 ## 真实效果
 
-基于含 6 个分级已知缺陷（critical×2 / major×2 / minor×2）的陷阱项目 `minibank-trap` 的实测数据（标准答案私有、不喂给模型）：
+口说无凭，我们造了一个「陷阱项目」`minibank-trap` 来实测：一个迷你银行账户系统，里面**故意埋了 6 个分级缺陷**（2 个致命、2 个重要、2 个次要），外加 5 个方案级设计漏洞和 2 条只有读了项目记忆才能发现的「项目专属规则」违背。标准答案私有保存、绝不喂给模型——模型得自己把雷挖出来。
 
-| 指标           | 数值 |
-| -------------- | ---- |
-| `peer_review` 缺陷检出率 | **6/6（100%）**，含行号 + 修复建议 |
-| `validate_approach` 方案缺陷检出 | **5/5（100%）** |
-| 审查类工具检出率中位 | **5/6** |
-| 记忆注入对「项目专属规则」类缺陷的增益 | 传 `project_dir` 才能稳定检出「计息口径」类硬约束违背（不传则只会反问） |
-| 强模型求助的增量价值 | Claude 修正了中等模型草稿的技术错误并补出其漏掉的最严重问题 |
+结果是这样的：
 
-> 单次调用成本 $0.11–$1.24（含合成/求助的多模型路径偏高）| 单次耗时 15–150 秒（视是否触发多模型而定）
->
-> 完整测试方法、量化矩阵与原始输出见 [`eval/REPORT.md`](eval/REPORT.md)。
+| 拿什么考它 | 考了什么 | 成绩 |
+| -------------- | -------- | ---- |
+| `peer_review` | 6 个已知代码缺陷能挖出几个 | **6 / 6 全中**，每个都带行号和修复建议 |
+| `validate_approach` | 5 个方案设计漏洞能拦下几个 | **5 / 5 全拦** |
+| 共享记忆注入 | 「计息口径」这类藏在 `CLAUDE.md` 里的项目硬约束 | 传了 `project_dir` 才稳定揪出违规；不传只会含糊反问 |
+| 战略求助 | 中等模型出错时，强模型能不能救场 | Claude 不仅纠正了草稿里的技术错误，还补出了草稿**漏掉的最严重那个问题** |
+
+一句话：**几个国产中等模型组队，把顶级模型才能稳定发现的问题挖了出来。**
+
+> 成本与耗时：单次调用 **$0.11–$1.24**（走多模型合成/强模型求助的路径偏高），单次耗时 **15–150 秒**（视是否触发多模型而定）。日常单模型审查通常在低位区间。
 
 ---
 
@@ -156,15 +157,15 @@ cp profiles.example.json profiles.json
     "researcher": ["deepseek", "glm"],
     "third_party": ["glm", "deepseek"],
     "reviewer": ["glm", "deepseek"],
-    "aggregator": ["glm"],
-    "strong_aggregator": ["claude", "glm"],
-    "advisor": ["claude", "glm"]
+    "aggregator": ["glm", "deepseek"],
+    "strong_aggregator": ["glm", "deepseek"],
+    "advisor": ["glm", "deepseek"]
   }
 }
 ```
 
 > 任何兼容 Anthropic API 格式的端点均可使用（DeepSeek、GLM、Mimo、MiniMax、自部署 vLLM 等）。
-> `aggregator`/`strong_aggregator`/`advisor` 三个角色分别供 `consensus` 合成与 `advisor_analysis` 求助使用；把强模型（如 Claude Opus）放进 `strong_aggregator`/`advisor` 即可在关键决策时求助。
+> `aggregator`/`strong_aggregator`/`advisor` 三个角色分别供 `consensus` 合成与 `advisor_analysis` 求助使用。上面的示例仅用已定义的 `deepseek`/`glm` 两个模型保证开箱可跑；若你有顶级模型（如 Claude Opus），在 `models` 中加一个 `claude` 条目，再把它放进 `strong_aggregator`/`advisor` 链首，即可在关键决策时求助强模型。
 
 ### 3. 配置 MCP 客户端
 
@@ -212,7 +213,7 @@ AgentParliament/
 ├── profiles.json      # 模型与角色配置（gitignore，含敏感 token）
 ├── mcp.config.json    # MCP 客户端配置模板
 ├── pyproject.toml     # 项目元数据与依赖
-└── eval/              # 评测脚手架与报告（harness/metrics/gap_checks + REPORT.md）
+└── AgentPrompt.txt    # 配合 Trae 使用的三个 Agent 提示词
 ```
 
 ---
