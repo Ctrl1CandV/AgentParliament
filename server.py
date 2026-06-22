@@ -1,14 +1,21 @@
 """
 server.py——AgentParliament的MCP入口
 
-通过stdio暴露5个只读工具给主Agent：
+通过stdio暴露7个只读工具给主Agent：
 1. delegate_research   —— 调研：把问题与相关文件交给副模型调研，回传结论
 2. peer_review         —— 代码审查：把git diff交给副模型审查，回传分级问题
 3. independent_analysis—— 独立分析：让第三方模型批判性审视已有结论，找盲区与漏洞
-4. consensus           —— 多模型共识：并行让多个模型回答同一问题，自动对比共识与分歧
+4. consensus           —— 多模型共识：并行让多个模型回答同一问题，自动对比共识与分歧；可开启synthesize让合成模型融合出单一结论
 5. validate_approach   —— 方案验证：让另一个模型扮演反对者，对架构/方案找漏洞
+6. test_audit          —— 测试审计：静态分析源码与测试，找出未覆盖的逻辑分支与边界
+7. advisor_analysis    —— 战略求助：中等模型先出草稿，不确定或高风险时条件升级求助强模型
 
 所有工具的副Agent都以只读plan模式运行，不会修改任何文件；改文件的动作始终留在主进程，由用户审阅后执行
+
+共享记忆：每个工具调用前会显式读取副Agent工作目录下的CLAUDE.md（项目共享记忆体），
+注入到prompt开头，使副Agent确定性地获得项目的领域语言、已定架构决策与硬约束，
+而不依赖Claude Code在headless模式下是否自动加载CLAUDE.md。记忆体缺失或读取失败时静默降级，不影响工具主流程。
+未传project_dir时在返回结果开头标注警告，提示记忆体未注入，避免主Agent在不知情下使用缺少项目上下文的结论。
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from runner import (
 )
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
+import json
 import sys
 mcp = FastMCP("AgentParliament")
 
@@ -67,7 +75,9 @@ def _format_result(result: RunResult) -> str:
         lines = ["[AgentParliament]所有候选模型均失败，未能完成任务。", "尝试记录："]
         for attempt in result.attempts:
             error_detail = attempt.error or "（无错误详情）"
-            lines.append(f"  - {attempt.model_name}: {error_detail}")
+            # error_type 作为独立标注，便于主Agent机器可读地判断失败原因类型（鉴权/限流/网络等）
+            type_tag = f"[{attempt.error_type}] " if attempt.error_type else ""
+            lines.append(f"  - {attempt.model_name}: {type_tag}{error_detail}")
         return "\n".join(lines)
 
     header = f"[AgentParliament]由模型`{result.model_used}`完成。"
@@ -110,6 +120,105 @@ def _resolve_cwd(project_dir: str | None) -> str:
         raise ProfileError(f"project_dir不存在或不是目录：{resolved}")
     return str(resolved)
 
+# 共享记忆体文件名。副Agent通过MCP显式读取并注入，从而确定性地获得项目的领域语言、
+# 已定架构决策与硬约束，而不依赖Claude Code在headless（-p）模式下是否会自动加载CLAUDE.md
+_MEMORY_FILENAME = "CLAUDE.md"
+
+# 注入记忆体的字符上限，防止异常膨胀的记忆体挤占prompt预算；超出时截断并提示
+_MEMORY_CHAR_LIMIT = 16000
+
+def _memory_block(cwd: str) -> str:
+    """
+    从副Agent工作目录读取共享记忆体（CLAUDE.md），渲染成注入prompt开头的记忆块
+    设计要点：
+    - 显式读取而非依赖Claude Code自动加载，确保被调用的副Agent确定性地获得项目记忆
+    - 记忆体是best-effort：文件不存在或读取失败都返回空串，绝不让记忆问题阻断工具主流程
+    - 超过字符上限时截断，避免异常膨胀的记忆体挤占prompt
+    返回值要么是空串，要么是带引导语和分隔符的完整记忆块
+    """
+    memory_path = Path(cwd) / _MEMORY_FILENAME
+    try:
+        if not memory_path.is_file():
+            return ""
+        content = memory_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        # 读取失败（权限、编码、IO等）不应影响工具调用，静默降级为"无记忆"
+        return ""
+
+    if not content:
+        return ""
+
+    if len(content) > _MEMORY_CHAR_LIMIT:
+        content = (
+            content[:_MEMORY_CHAR_LIMIT]
+            + "\n…（项目记忆超过长度上限已截断，完整内容见项目CLAUDE.md）"
+        )
+
+    return (
+        "[项目记忆] 以下是本项目的共享记忆体（CLAUDE.md），"
+        "包含领域语言、已定架构决策、硬约束与当前状态。\n"
+        "请在工作时沿用其中的术语、遵守其中的约束，不要与已定决策冲突；"
+        "若你的分析与记忆体存在矛盾，请明确指出而非默默忽略。\n"
+        "————（项目记忆开始）————\n"
+        f"{content}\n"
+        "————（项目记忆结束）————\n\n"
+    )
+
+def _project_dir_warning(project_dir: str | None) -> str:
+    """
+    project_dir 未传时返回警告，提示记忆体未注入；已传则返回空串。
+    设计要点：
+    - 不强制报错（调试 AgentParliament 自身时不传 project_dir 是合理的）
+    - 不改 _memory_block 的 best-effort 语义
+    - 只在结果 header 加一条可见警告，让主Agent感知到「这次调用没带记忆体」
+    """
+    if project_dir:
+        return ""
+    return (
+        "[AgentParliament]⚠️未传 project_dir，本次未读取目标项目 CLAUDE.md 记忆体，"
+        "副Agent缺少领域语言/架构决策/硬约束上下文。仅调试 AgentParliament 自身时可忽略。\n\n"
+    )
+
+# structured review 输出中每个问题对象必须包含的字段
+_REQUIRED_REVIEW_KEYS = {"severity", "file", "line", "description", "suggestion"}
+
+def _validate_structured_review(text: str) -> tuple[bool, str, str]:
+    """
+    尽力解析 peer_review(structured=True) 的输出。
+    返回 (ok, cleaned_json_or_raw, message)：
+    - ok=True：解析成功，cleaned_json 为干净 JSON 数组文本
+    - ok=False：解析失败，cleaned_json 为原始文本（供主Agent人工 salvage），message 为失败原因
+    设计取舍：不自动重试（run_with_chain 已跑完整条链，重试成本翻倍）；
+    解析失败时仍返回原始文本，不隐藏失败信号
+    """
+    raw = text.strip()
+
+    # 剥 markdown fence：模型有时会把 JSON 包在 ```json ... ``` 里
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+
+    try:
+        arr = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return False, text, f"[格式校验失败]无法解析为JSON：{exc}"
+
+    if not isinstance(arr, list):
+        return False, text, "[格式校验失败]顶层不是数组"
+
+    for i, item in enumerate(arr):
+        if not isinstance(item, dict):
+            return False, text, f"[格式校验失败]第{i}项不是对象"
+        missing = _REQUIRED_REVIEW_KEYS - item.keys()
+        if missing:
+            return False, text, f"[格式校验失败]第{i}项缺字段：{missing}"
+
+    return True, json.dumps(arr, ensure_ascii=False), ""
+
 # 工具 1：delegate_research
 @mcp.tool()
 def delegate_research(
@@ -130,7 +239,7 @@ def delegate_research(
     Args:
         question: 要副Agent回答的调研问题，应尽量具体
         role: 使用profiles.json中的哪条角色失败链，默认"researcher"
-        project_dir: 副Agent的工作目录，项目根目录。不传则用MCP所在目录
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录。不传则退回MCP所在目录，仅适合调试AgentParliament自身
         context_files: 可选，主Agent已定位的相关文件路径列表。会拼进提示词，引导副Agent优先阅读这些文件，避免从头扫描整个项目造成浪费
         allow_web: 可选，是否允许副Agent联网搜索（WebSearch/WebFetch）。默认False（仅本地代码调研）。
             当调研问题涉及最新文档、版本特性、外部资料时设为True；副Agent仍处于只读plan模式，联网仅用于获取信息，不会改文件
@@ -160,17 +269,18 @@ def delegate_research(
     allowed_tools = ["WebSearch", "WebFetch"] if allow_web else None
 
     try:
+        cwd = _resolve_cwd(project_dir)
         result = run_with_chain(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
             allowed_tools=allowed_tools,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
-    return _format_result(result)
+    return _project_dir_warning(project_dir) + _format_result(result)
 
 # 工具 2：peer_review
 @mcp.tool()
@@ -188,7 +298,7 @@ def peer_review(
         diff: 待审查的改动，通常是`git diff`的输出。大小限制约200KB，超过请改用文件路径
         role: 使用哪条角色失败链，默认"reviewer"
         focus: 可选，审查重点（如"安全性""并发""边界条件"），留空则做全面审查
-        project_dir: 副Agent的工作目录，便于它在需要时阅读改动涉及的上下文文件
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
         context_files: 可选，与本次改动相关的文件路径列表，如被改函数的调用方、接口定义
             传入后副Agent会阅读这些文件以理解跨文件交互，避免纯diff审查只见局部、看不到接口契约与调用方影响的盲区
         structured: 可选，是否要求副Agent以JSON结构输出审查结果。默认False（人类可读的分级文本）。
@@ -255,17 +365,34 @@ def peer_review(
     )
 
     try:
+        cwd = _resolve_cwd(project_dir)
         result = run_with_chain(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
             extra_dirs=extra_dirs,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
-    return _format_result(result)
+    # structured=True 时对模型输出做尽力解析：剥 markdown fence、json.loads、校验必填字段。
+    # 解析失败不重试（run_with_chain 已跑完整条链），但明确标注失败并保留原始输出供主Agent salvage。
+    # 整链失败时 result.text 为空，直接走失败渲染，避免误报"无法解析为JSON"掩盖真实失败原因。
+    if structured and result.ok:
+        ok, cleaned, msg = _validate_structured_review(result.text)
+        # _format_result 的 header 与正文之间用 "\n\n" 分隔，取 header 部分复用
+        rendered = _format_result(result)
+        header, _, body = rendered.partition("\n\n")
+        if not ok:
+            return (
+                _project_dir_warning(project_dir)
+                + header + "\n" + msg + "\n\n原始输出：\n" + body
+            )
+        # 校验通过：用干净 JSON 替换正文
+        return _project_dir_warning(project_dir) + header + "\n\n" + cleaned
+
+    return _project_dir_warning(project_dir) + _format_result(result)
 
 # 工具 3：independent_analysis
 @mcp.tool()
@@ -286,7 +413,7 @@ def independent_analysis(
         existing_result: 主Agent已经拿到的结论
         concern: 可选，主Agent具体担心什么（如"是否遗漏了边界条件""性能评估是否准确"），帮助副Agent聚焦审查
         role: 使用哪条角色失败链，默认"third_party"，且优先用与主Agent不同的模型以获得独立视角
-        project_dir: 副Agent的工作目录，便于它在需要时查阅代码上下文
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
 
     Returns:
         结构化的独立分析报告，含共识、分歧与替代判断。
@@ -320,16 +447,17 @@ def independent_analysis(
     )
 
     try:
+        cwd = _resolve_cwd(project_dir)
         result = run_with_chain(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
-    return _format_result(result)
+    return _project_dir_warning(project_dir) + _format_result(result)
 
 # 工具 4：consensus
 @mcp.tool()
@@ -338,6 +466,8 @@ def consensus(
     role: str = "third_party",
     project_dir: str | None = None,
     context_files: list[str] | None = None,
+    synthesize: bool = False,
+    aggregator_role: str = "reviewer",
 ) -> str:
     """
     并行让多个模型独立回答同一问题，然后自动对比共识与分歧
@@ -351,11 +481,18 @@ def consensus(
     Args:
         question: 要多模型回答的问题，应尽量具体
         role: 使用哪条角色链上的模型，默认"third_party"
-        project_dir: 副Agent的工作目录，不传则用MCP所在目录
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
         context_files: 可选，主Agent已定位的相关文件路径列表
+        synthesize: 可选，是否在收集各模型回答后再跑一次合成模型，输出单一综合结论。默认False（各模型回答原样拼接，由主Agent自己综合）。
+            设为True时额外用aggregator_role指定的角色链跑一次合成，成本增加一次模型调用，但能真正deliver"拼好模"——把多个中等模型的视角融合成一个高质量结论。
+            日常建议用中等模型合成（aggregator_role="aggregator"），关键决策可用强模型合成（aggregator_role="strong_aggregator"）
+        aggregator_role: 可选，合成用的角色失败链，默认"reviewer"。
+            在profiles.json中配置"aggregator"(中等模型)和"strong_aggregator"(含claude等强模型)两种角色，按场景选用
 
     Returns:
-        多模型回答的对比报告，含各模型独立回答、共识点、分歧点与综合判断
+        多模型回答的对比报告。
+        synthesize=False：含各模型独立回答，由主Agent自行对比共识与分歧。
+        synthesize=True：先给单一合成结论，再附各模型原始回答（保留分歧信号，便于主Agent追溯）。
     """
     prompt = question
     if context_files:
@@ -376,17 +513,18 @@ def consensus(
     )
 
     try:
+        cwd = _resolve_cwd(project_dir)
         parallel = run_parallel(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
     if parallel.all_failed:
-        return _format_parallel_result(parallel)
+        return _project_dir_warning(project_dir) + _format_parallel_result(parallel)
 
     # 手动汇总：把各模型结果拼在一起，让主Agent看到对比，主Agent自己就是最好的综合者
     sections = []
@@ -401,7 +539,67 @@ def consensus(
         header += f" 总成本：${parallel.total_cost_usd:.4f}"
     header += "\n以下是各模型的独立回答，请由主Agent自行对比共识与分歧。"
 
-    return f"{header}\n\n" + "\n\n---\n\n".join(sections)
+    # synthesize=False：现有行为不变，各模型回答原样拼接由主Agent自己综合
+    if not synthesize:
+        return _project_dir_warning(project_dir) + f"{header}\n\n" + "\n\n---\n\n".join(sections)
+
+    # synthesize=True：额外跑一次合成模型，融合各模型回答输出单一结论。
+    # 执行到此处时必有成功回答（all_failed 已在前面提前返回），合成失败不阻断，降级返回原始拼接结果。
+    answers_block = "\n\n---\n\n".join(sections)
+    synth_prompt = (
+        "以下是多个模型对同一问题的独立回答。请综合它们的共识、裁决分歧，"
+        "输出一个单一的高质量结论。不要简单平均，要批判性地择优："
+        "若多数模型一致但某个模型有独到见解，请吸收独到部分；"
+        "若模型间存在根本分歧，请明确指出并给出你的裁决与理由。\n\n"
+        f"原始问题：{question}\n\n"
+        f"{answers_block}\n\n"
+        "请按以下结构输出：\n"
+        "1.【综合结论】你对原始问题的直接回答\n"
+        "2.【共识点】多个模型一致的结论\n"
+        "3.【分歧与裁决】模型间分歧及你的裁决理由\n"
+        "4.【采用理由】为何采用这一综合结论"
+    )
+
+    try:
+        synth_result = run_with_chain(
+            config=_get_config(),
+            role=aggregator_role,
+            prompt=_memory_block(cwd) + synth_prompt,
+            cwd=cwd,
+        )
+    except ProfileError as exc:
+        # 合成模型角色链配置错误时，降级返回原始拼接结果，并在开头标注
+        return (
+            _project_dir_warning(project_dir)
+            + f"[AgentParliament]合成模型调用失败：{exc}\n\n"
+            + f"{header}\n\n" + "\n\n---\n\n".join(sections)
+        )
+
+    if not synth_result.ok:
+        # 合成模型整链失败时，降级返回原始拼接结果
+        return (
+            _project_dir_warning(project_dir)
+            + f"{header}\n\n（合成模型失败，以下为各模型原始回答）\n\n"
+            + "\n\n---\n\n".join(sections)
+        )
+
+    # 合成成功：先给单一综合结论，再附各模型原始回答，保留分歧信号便于主Agent追溯
+    synth_header = (
+        f"[AgentParliament]已由`{synth_result.model_used}`合成"
+        f"{len(parallel.successful)}个模型的回答。"
+    )
+    if synth_result.degraded:
+        synth_header += "\n注意：合成首选模型不可用，已降级。"
+    total_cost = parallel.total_cost_usd + synth_result.total_cost_usd
+    if total_cost > 0:
+        synth_header += f" 本次总成本：${total_cost:.4f}"
+
+    return (
+        _project_dir_warning(project_dir)
+        + synth_header + "\n\n" + synth_result.text
+        + "\n\n———— 原始各模型回答 ————\n\n"
+        + "\n\n---\n\n".join(sections)
+    )
 
 # 工具 5：validate_approach
 @mcp.tool()
@@ -420,7 +618,7 @@ def validate_approach(
         approach: 待验证的方案/架构/设计描述
         goal: 可选，方案要达成的目标，帮助副Agent判断方案是否偏离目标
         role: 使用哪条角色失败链，默认"third_party"
-        project_dir: 副Agent的工作目录，便于它查阅项目现有代码以评估方案可行性
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
 
     Returns:
         方案验证报告，含潜在风险、遗漏场景与改进建议
@@ -451,16 +649,17 @@ def validate_approach(
     )
 
     try:
+        cwd = _resolve_cwd(project_dir)
         result = run_with_chain(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
-    return _format_result(result)
+    return _project_dir_warning(project_dir) + _format_result(result)
 
 # 工具 6：test_audit
 @mcp.tool()
@@ -481,7 +680,7 @@ def test_audit(
         test_files: 可选，现有测试文件路径列表。传入后副Agent会对比现有测试与源码，找出缺口；不传则只基于源码给出建议测试清单
         focus: 可选，审计重点，如"异常路径""并发""边界值"，留空则全面审计
         role: 使用哪条角色失败链，默认"reviewer"
-        project_dir: 副Agent的工作目录，便于它阅读传入的文件
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
 
     Returns:
         测试审计报告，含已覆盖情况、缺失场景与建议补充的测试用例
@@ -529,17 +728,116 @@ def test_audit(
     )
 
     try:
+        cwd = _resolve_cwd(project_dir)
         result = run_with_chain(
             config=_get_config(),
             role=role,
-            prompt=prompt,
-            cwd=_resolve_cwd(project_dir),
+            prompt=_memory_block(cwd) + prompt,
+            cwd=cwd,
             extra_dirs=extra_dirs,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
 
-    return _format_result(result)
+    return _project_dir_warning(project_dir) + _format_result(result)
+
+# advisor_analysis 触发升级的哨兵标记。中等模型在草稿末尾输出此标记表示「我不确定，请求助强模型」
+_NEED_ADVISOR_TAG = "[NEED_ADVISOR]"
+
+# 工具 7：advisor_analysis
+@mcp.tool()
+def advisor_analysis(
+    task: str,
+    draft_role: str = "researcher",
+    advisor_role: str = "advisor",
+    force_advisor: bool = False,
+    project_dir: str | None = None,
+    context_files: list[str] | None = None,
+) -> str:
+    """
+    两阶段战略求助：中等模型先出草稿，不确定或高风险时才升级求助强模型（如claude）。
+    这是 FrugalGPT「按置信度升级」思路的变体——不是失败才升级，是不确定才升级，
+    因此大多数调用只跑一次中等模型，成本与 delegate_research 相当。
+
+    与 independent_analysis 的区别：independent_analysis 总是跑第三方模型做批判；
+    本工具是条件触发（省成本），且专为「中等模型可能不够、但又不想每次都烧强模型」的场景设计。
+
+    [使用前提] 调用前你已对问题有初步判断。本工具用于「想用便宜模型兜底、关键处再求助强模型」的场景。
+    在 profiles.json 中把 advisor_role 配为含 claude 的角色链（如 ["claude","glm"]）才能发挥效果。
+
+    Args:
+        task: 要分析的问题/任务
+        draft_role: 出草稿的中等模型角色链，默认"researcher"
+        advisor_role: 求助的强模型角色链，默认"advisor"（建议在profiles.json配为["claude","glm"]）
+        force_advisor: 主Agent强制升级求助。高风险决策（架构选型/安全/数据完整性）时设为True
+        project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录；不传则退回MCP所在目录，仅适合调试AgentParliament自身
+        context_files: 可选，相关文件路径列表，会拼进草稿阶段的提示词
+
+    Returns:
+        不触发升级时：仅返回中等模型草稿（成本同 delegate_research）。
+        触发升级时：先返回草稿，再返回强模型顾问意见，让主Agent看到两阶段对比。
+    """
+    # 草稿阶段：要求中等模型在不确定时自评并输出升级标记。这是初版置信度信号，不完美但成本极低
+    draft_prompt = (
+        f"{task}\n\n"
+        "请给出你的结论。如果你对答案有把握，直接给结论即可；"
+        "如果你不确定、或问题涉及高风险决策（架构选型/安全/数据完整性等），"
+        f"在回答最末尾另起一行写出标记：{_NEED_ADVISOR_TAG}"
+    )
+    if context_files:
+        joined = "\n".join(f"- {p}" for p in context_files)
+        draft_prompt += f"\n\n请优先阅读以下相关文件，无需扫描整个项目：\n{joined}"
+
+    try:
+        cwd = _resolve_cwd(project_dir)
+        draft = run_with_chain(
+            config=_get_config(),
+            role=draft_role,
+            prompt=_memory_block(cwd) + draft_prompt,
+            cwd=cwd,
+        )
+    except ProfileError as exc:
+        return f"[AgentParliament] 配置或调用错误：{exc}"
+
+    # 升级条件：主Agent强制 或 中等模型自评不确定（草稿末尾含升级标记）
+    escalate = force_advisor or (
+        draft.ok and _NEED_ADVISOR_TAG in draft.text
+    )
+
+    if not escalate:
+        # 未升级：只返回草稿。force_advisor=False 且模型有把握时走此分支
+        return _project_dir_warning(project_dir) + _format_result(draft)
+
+    # 升级：求助强模型审查草稿并给出权威结论
+    advisor_prompt = (
+        f"原始任务：{task}\n\n"
+        "中等模型的草稿结论如下（仅供参考，可能存在盲区或错误）：\n"
+        f"{draft.text}\n\n"
+        "你作为资深顾问，请审查草稿：若草稿正确请明确认可并补充论据；"
+        "若有问题请指出并给出修正后的权威结论。"
+    )
+
+    try:
+        advisor = run_with_chain(
+            config=_get_config(),
+            role=advisor_role,
+            prompt=_memory_block(cwd) + advisor_prompt,
+            cwd=cwd,
+        )
+    except ProfileError as exc:
+        # 强模型角色链配置错误：返回草稿并标注求助失败
+        return (
+            _project_dir_warning(project_dir)
+            + _format_result(draft)
+            + f"\n\n[AgentParliament]强模型求助失败：{exc}"
+        )
+
+    # 返回两阶段：草稿在前（主Agent可对比），顾问意见在后（权威结论）
+    return (
+        _project_dir_warning(project_dir)
+        + "【阶段1：中等模型草稿】\n" + _format_result(draft)
+        + "\n\n【阶段2：强模型顾问意见】\n" + _format_result(advisor)
+    )
 
 
 def main() -> None:

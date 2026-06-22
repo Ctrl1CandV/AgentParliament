@@ -19,8 +19,11 @@
   },
 
   "roles": {
-    "researcher": ["deepseek"],
+    "researcher": ["deepseek", "glm"],
     "third_party": ["glm", "deepseek"],
-    "reviewer": ["deepseek"]
+    "reviewer": ["glm", "deepseek"],
+    "aggregator": ["glm", "deepseek"],
+    "strong_aggregator": ["glm"],
+    "advisor": ["glm"]
   }
 }

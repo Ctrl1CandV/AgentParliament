@@ -9,6 +9,7 @@ profiles.json
 .vscode/
 .DS_Store
 .claude/
+CLAUDE.md
 Thumbs.db
 
 logs/

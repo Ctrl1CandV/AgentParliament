@@ -30,26 +30,37 @@
 
 ## 它能做什么？
 
-### 6 个专业工具，覆盖开发全流程
+### 7 个专业工具，覆盖开发全流程
 
-<table>
-<tr>
-<td width="50%">
+| 工具 | 作用 | 典型场景 |
+| ---- | ---- | -------- |
+| **delegate_research** | 委托副模型做只读调研，回传结构化结论 | 复杂问题需要第二视角，或想把调研从主会话剥离以保持上下文干净 |
+| **peer_review** | 对 `git diff` 做分级代码审查（🔴严重/🟠重要/🟡次要/🟢建议） | 完成实现后想要另一个模型独立核查；支持 `structured=True` 输出可程序化处理的 JSON |
+| **independent_analysis** | 让第三方模型批判性审视已有结论，找盲区与逻辑漏洞 | 拿到结论后仍不确定、想验证可靠性 |
+| **consensus** | 并行多模型回答同一问题，自动对比共识与分歧；可选 `synthesize=True` 让聚合模型融合出单一结论 | 关键决策需要多模型交叉验证（真正的「拼好模」） |
+| **validate_approach** | 让模型扮演反对者，对架构/方案找漏洞 | 方案实施前提前排雷 |
+| **test_audit** | 静态分析源码与测试，找出未覆盖的逻辑分支与边界 | 实现完功能后想知道「哪些情况还没测到」 |
+| **advisor_analysis** | 两阶段战略求助：中等模型先出草稿，不确定或高风险时才升级求助强模型 | 想用便宜模型兜底、关键处再求助强模型（如 Claude Opus） |
+
+> 所有副 Agent 均以 `--permission-mode plan` 只读运行，永远不会修改你的文件。
 
 ---
 
 ## 真实效果
 
-基于含 7 个已知缺陷的评测项目的实测数据：
+基于含 6 个分级已知缺陷（critical×2 / major×2 / minor×2）的陷阱项目 `minibank-trap` 的实测数据（标准答案私有、不喂给模型）：
 
-| 指标           | 无工具辅助       | AgentParliament 辅助                                 | 提升           |
-| -------------- | ---------------- | ---------------------------------------------------- | -------------- |
-| 缺陷发现量     | 5-8 个（表面级） | **34 个**（含行号+修复建议）                   | **4-5x** |
-| 已知缺陷命中率 | ~40%             | **100%**（test_audit 单工具）                  | —             |
-| 否决错误方案   | 无               | **1 次**（PriorityQueue 方案因命名冲突不可行） | —             |
-| 严重度升级     | 无               | **1 次**（非原子写入 major→critical）         | —             |
+| 指标           | 数值 |
+| -------------- | ---- |
+| `peer_review` 缺陷检出率 | **6/6（100%）**，含行号 + 修复建议 |
+| `validate_approach` 方案缺陷检出 | **5/5（100%）** |
+| 审查类工具检出率中位 | **5/6** |
+| 记忆注入对「项目专属规则」类缺陷的增益 | 传 `project_dir` 才能稳定检出「计息口径」类硬约束违背（不传则只会反问） |
+| 强模型求助的增量价值 | Claude 修正了中等模型草稿的技术错误并补出其漏掉的最严重问题 |
 
-> 单次调用成本 $0.08-$0.32 | 单缺陷成本 $0.038 | 单次耗时 15-35 秒
+> 单次调用成本 $0.11–$1.24（含合成/求助的多模型路径偏高）| 单次耗时 15–150 秒（视是否触发多模型而定）
+>
+> 完整测试方法、量化矩阵与原始输出见 [`eval/REPORT.md`](eval/REPORT.md)。
 
 ---
 
@@ -61,11 +72,26 @@
 
 ```json
 "roles": {
-  "reviewer": ["glm", "mimo", "deepseek"],
-  "researcher": ["deepseek", "glm"],
-  "third_party": ["glm", "deepseek", "mimo"]
+  "researcher": ["deepseek", "glm", "minimax"],
+  "third_party": ["glm", "deepseek", "mimo"],
+  "reviewer": ["glm", "mimo", "deepseek", "minimax"],
+  "aggregator": ["glm", "deepseek"],
+  "strong_aggregator": ["claude", "glm"],
+  "advisor": ["claude", "glm"]
 }
 ```
+
+### 🧠 共享记忆注入——让副 Agent「懂这个项目」
+
+每次调用前显式读取项目根目录的 `CLAUDE.md`（领域语言、架构决策、硬约束）并注入 prompt 开头，使副 Agent 确定性地获得项目上下文，而非依赖 Claude Code 是否自动加载。实测显示：传入 `project_dir` 后，副 Agent 才能稳定发现「违反项目专属规则」类缺陷（如计息口径、金额存储约定）。未传时结果开头会出现明确警告，提示记忆体未注入。
+
+### 🎯 战略求助——中等模型扛大头，关键处求助强模型
+
+`advisor_analysis` 采用两阶段：中等模型先出草稿，仅在它自评不确定（输出 `[NEED_ADVISOR]`）或主 Agent 显式 `force_advisor=True` 时，才升级求助强模型。大多数调用只花一次中等模型的成本，关键决策才动用强模型——这是「逼近」而非「依赖」顶级模型。
+
+### 🧩 多模型融合（拼好模）——consensus 合成
+
+`consensus(synthesize=True)` 在并行收集各模型回答后，额外用聚合模型（`aggregator_role` 可配）批判性地裁决分歧、融合出单一高质量结论，同时保留各模型原始回答供追溯。日常用中等模型聚合，关键决策可指定强模型聚合。
 
 ### 🔒 只读安全——副Agent无法改文件
 
@@ -82,7 +108,7 @@
 
 ### 📊 结构化输出——可程序化处理
 
-`peer_review(structured=True)` 返回 JSON 数组，每个 issue 含 severity/file/line/description/suggestion，可直接 `json.loads()` 提取统计。
+`peer_review(structured=True)` 返回 JSON 数组，每个 issue 含 severity/file/line/description/suggestion，可直接 `json.loads()` 提取统计。输出经校验（剥 markdown fence、字段完整性检查），坏 JSON 会被标注 `[格式校验失败]` 并保留原文供人工 salvage。
 
 ---
 
@@ -129,12 +155,16 @@ cp profiles.example.json profiles.json
   "roles": {
     "researcher": ["deepseek", "glm"],
     "third_party": ["glm", "deepseek"],
-    "reviewer": ["glm", "deepseek"]
+    "reviewer": ["glm", "deepseek"],
+    "aggregator": ["glm"],
+    "strong_aggregator": ["claude", "glm"],
+    "advisor": ["claude", "glm"]
   }
 }
 ```
 
-> 任何兼容 Anthropic API 格式的端点均可使用（DeepSeek、GLM、Mimo、自部署 vLLM 等）。
+> 任何兼容 Anthropic API 格式的端点均可使用（DeepSeek、GLM、Mimo、MiniMax、自部署 vLLM 等）。
+> `aggregator`/`strong_aggregator`/`advisor` 三个角色分别供 `consensus` 合成与 `advisor_analysis` 求助使用；把强模型（如 Claude Opus）放进 `strong_aggregator`/`advisor` 即可在关键决策时求助。
 
 ### 3. 配置 MCP 客户端
 
@@ -177,13 +207,29 @@ cp profiles.example.json profiles.json
 
 ```
 AgentParliament/
-├── server.py          # MCP 服务入口，6 个工具定义
+├── server.py          # MCP 服务入口，7 个工具定义
 ├── runner.py          # 核心执行层，子进程管理、失败链、环境隔离
 ├── profiles.json      # 模型与角色配置（gitignore，含敏感 token）
 ├── mcp.config.json    # MCP 客户端配置模板
 ├── pyproject.toml     # 项目元数据与依赖
-└── sandbox/           # 评测产物（gitignore）
+└── eval/              # 评测脚手架与报告（harness/metrics/gap_checks + REPORT.md）
 ```
+
+---
+
+## 配合 Trae 三个 Agent 使用（推荐）
+
+AgentParliament 本身是一个被调用的 MCP 工具；要让它发挥最大价值，推荐配合 Trae 中三个分工明确的角色 Agent 使用——它们在不同开发阶段介入，并在恰当时机调用本 MCP 的工具来交叉验证自己的判断。
+
+| Agent | 职责 | 介入阶段 | 主要调用的工具 |
+| ----- | ---- | -------- | -------------- |
+| **project_planner**（前期规划者） | 需求分析、调研、架构设计、前置风险 | 动工前「先想清楚」 | `delegate_research(allow_web=True)`、`validate_approach`、`consensus` |
+| **code_developer**（代码开发者） | 按既定方案做最小必要、可维护的实现与修复 | 实现与改 bug | `peer_review`、`validate_approach`、`test_audit`、`delegate_research` |
+| **untangler**（纾困复盘者） | 卡顿时跳出泥潭、理清现状、判断方向 | 反复修补无果、方向模糊时 | `independent_analysis`、`consensus`、`delegate_research` |
+
+三个 Agent 的完整提示词与「何时调用」说明见 [`AgentPrompt.txt`](AgentPrompt.txt)，可直接整段粘贴到 Trae 的 Agent 设置中。它们共享一条铁律：**MCP 工具用来交叉验证、不替代自己思考——先有自己的结论，再用工具印证或证伪。** 同时三者都会在工作前读取项目根目录的 `CLAUDE.md` 共享记忆体，与本 MCP 的记忆注入机制形成闭环。
+
+> 这套角色分工是可选的。你也可以在任意支持 MCP 的客户端里直接调用这 7 个工具，不依赖上述 Agent。
 
 ---
 
@@ -199,7 +245,7 @@ CLI 自带文件系统访问能力（Read/Grep/Glob），副Agent可以直接读
 <details>
 <summary><b>支持哪些模型？</b></summary>
 
-任何兼容 Anthropic API 格式的端点均可。已验证：DeepSeek、GLM（火山引擎）、Mimo。自部署的 vLLM/TGI 端点只要实现 `/v1/messages` 接口即可使用。
+任何兼容 Anthropic API 格式的端点均可。已验证：DeepSeek、GLM（火山引擎）、Mimo、MiniMax、Claude Opus（作为 `advisor`/`strong_aggregator` 的强模型）。自部署的 vLLM/TGI 端点只要实现 `/v1/messages` 接口即可使用。
 
 </details>
 

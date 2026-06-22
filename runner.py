@@ -86,6 +86,7 @@ class AttemptResult:
     text: str = ""
     error: str = ""
     cost_usd: float | None = None
+    error_type: str = ""
 
 @dataclass
 class RunResult:
@@ -104,6 +105,24 @@ class RunResult:
     def total_cost_usd(self) -> float:
         """ 本轮所有尝试的累计成本 """
         return sum(a.cost_usd or 0.0 for a in self.attempts)
+
+@dataclass
+class ParallelResult:
+    """ 并行执行多个模型后的汇总结果 """
+    results: list[AttemptResult]
+    total_cost_usd: float = 0.0
+
+    @property
+    def successful(self) -> list[AttemptResult]:
+        return [r for r in self.results if r.ok]
+
+    @property
+    def failed(self) -> list[AttemptResult]:
+        return [r for r in self.results if not r.ok]
+
+    @property
+    def all_failed(self) -> bool:
+        return not self.successful
 
 def load_config(path: Path = PROFILES_PATH) -> Config:
     """ 读取并校验profiles.json """
@@ -272,7 +291,6 @@ def _classify_error(returncode: int, stderr: str) -> str:
         )
     return "未知错误"
 
-
 def _run_once(
     profile: ModelProfile,
     prompt: str, cwd: str,
@@ -316,6 +334,7 @@ def _run_once(
         return AttemptResult(
             model_name=profile.name, ok=False,
             error=f"子进程超时>{timeout_seconds}s",
+            error_type="超时",
         )
 
     if _DEBUG:
@@ -339,9 +358,12 @@ def _run_once(
         stderr = (completed.stderr or "").strip()
 
         error_type = _classify_error(completed.returncode, stderr)
+        # error_type 已作为独立结构化字段返回，由上层 _format_result 统一渲染，
+        # 故此处 error 字符串不再内嵌 [error_type] 前缀，避免展示时重复出现
         return AttemptResult(
             model_name=profile.name, ok=False,
-            error=f"[{error_type}] 子进程退出码{completed.returncode}：{stderr[:500]}",
+            error=f"子进程退出码{completed.returncode}：{stderr[:500]}",
+            error_type=error_type,
         )
 
     # 解析json格式，传入prompt字符数用于截断护栏检测
@@ -386,24 +408,6 @@ def run_with_chain(
 
     # 链上所有模型都失败了
     return RunResult(ok=False, text="", model_used=None, attempts=attempts)
-
-@dataclass
-class ParallelResult:
-    """ 并行执行多个模型后的汇总结果 """
-    results: list[AttemptResult]
-    total_cost_usd: float = 0.0
-
-    @property
-    def successful(self) -> list[AttemptResult]:
-        return [r for r in self.results if r.ok]
-
-    @property
-    def failed(self) -> list[AttemptResult]:
-        return [r for r in self.results if not r.ok]
-
-    @property
-    def all_failed(self) -> bool:
-        return not self.successful
 
 def run_parallel(
     config: Config, role: str,
