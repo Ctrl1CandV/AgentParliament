@@ -297,26 +297,35 @@ def _run_once(
     timeout_seconds: int,
     extra_dirs: list[str] | None = None,
     allowed_tools: list[str] | None = None,
+    permission_mode: str = "plan",
+    disallowed_tools: list[str] | None = None,
 ) -> AttemptResult:
     """
     用指定模型profile启动一次只读子进程并返回结果
-    只依赖--permission-mode plan保证只读：plan模式下Claude Code内置
-    禁止所有写操作，无需再额外传 --allowedTools 来保证只读
-    这样副Agent仍可使用Read/Grep/Glob以及只读Bash等内置工具完成调研
-    allowed_tools用于按需放开plan模式下默认不自动允许的只读工具（如WebSearch），
-    它只做加法，不会突破plan模式的只读边界
+    permission_mode：
+    - "plan"（默认）：--permission-mode plan，Claude Code内置禁止所有写操作，最严格的只读沙箱；
+      缺点是plan模式语义为"调研→写计划→等待人类审批"，对headless单轮调研会造成副Agent停在"等待审阅"
+    - "default"：--permission-mode default，需配合allowed_tools显式限定为只读工具集（Read/Grep/Glob/WebSearch/WebFetch），
+      适合需要副Agent直接输出结论而非停下来等待审批的场景（如delegate_research）
+    allowed_tools：
+    - plan模式下用于按需放开plan模式下默认不自动允许的只读工具（如WebSearch），只做加法
+    - default模式下必须显式给出全部允许的工具，以约束只读边界，否则会按default模式的默认权限运行
+    disallowed_tools：
+    - 可选工具黑名单，--disallowedTools，优先级高于allowed_tools。用于 default 模式下防御 CLI 版本差异导致默认权限破防
     """
     claude_exe = _resolve_claude_executable()
 
     cmd = [
         claude_exe,
         "--output-format", "json",
-        "--permission-mode", "plan",
+        "--permission-mode", permission_mode,
     ]
     for directory in extra_dirs or []:
         cmd += ["--add-dir", directory]
     if allowed_tools:
         cmd += ["--allowedTools", ",".join(allowed_tools)]
+    if disallowed_tools:
+        cmd += ["--disallowedTools", ",".join(disallowed_tools)]
     cmd.append("-p")
 
     env = profile.build_env(os.environ)
@@ -378,6 +387,8 @@ def run_with_chain(
     prompt: str, cwd: str,
     extra_dirs: list[str] | None = None,
     allowed_tools: list[str] | None = None,
+    permission_mode: str = "plan",
+    disallowed_tools: list[str] | None = None,
 ) -> RunResult:
     """
     按角色失败链依次尝试，第一个成功即返回；全部失败则返回失败结果
@@ -396,6 +407,8 @@ def run_with_chain(
             timeout_seconds=config.timeout_seconds,
             extra_dirs=extra_dirs,
             allowed_tools=allowed_tools,
+            permission_mode=permission_mode,
+            disallowed_tools=disallowed_tools,
         )
         attempts.append(attempt)
         if attempt.ok:
@@ -414,6 +427,8 @@ def run_parallel(
     prompt: str, cwd: str,
     extra_dirs: list[str] | None = None,
     allowed_tools: list[str] | None = None,
+    permission_mode: str = "plan",
+    disallowed_tools: list[str] | None = None,
 ) -> ParallelResult:
     """
     并行启动角色链上的所有模型，每个模型独立执行，互不降级
@@ -435,6 +450,8 @@ def run_parallel(
                 timeout_seconds=config.timeout_seconds,
                 extra_dirs=extra_dirs,
                 allowed_tools=allowed_tools,
+                permission_mode=permission_mode,
+                disallowed_tools=disallowed_tools,
             )
         except Exception as exc:
             # 单个模型的意外异常不应拖垮整个并行批次，转成失败结果以保持run_parallel"各模型互不影响"的契约

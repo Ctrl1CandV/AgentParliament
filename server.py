@@ -10,7 +10,11 @@ server.py——AgentParliament的MCP入口
 6. test_audit          —— 测试审计：静态分析源码与测试，找出未覆盖的逻辑分支与边界
 7. advisor_analysis    —— 战略求助：中等模型先出草稿，不确定或高风险时条件升级求助强模型
 
-所有工具的副Agent都以只读plan模式运行，不会修改任何文件；改文件的动作始终留在主进程，由用户审阅后执行
+所有工具的副Agent都以只读模式运行，不会修改任何文件；改文件的动作始终留在主进程，由用户审阅后执行
+- peer_review / independent_analysis / consensus / validate_approach / test_audit / advisor_analysis：
+  使用 --permission-mode plan（Claude Code内置禁止所有写操作）
+- delegate_research：使用 --permission-mode default + 显式只读工具白名单 + 写操作黑名单
+  （plan模式的"提案后等待人类审批"语义会让headless单轮调研卡在"等待审阅"，故改用default模式）
 
 共享记忆：每个工具调用前会显式读取副Agent工作目录下的CLAUDE.md（项目共享记忆体），
 注入到prompt开头，使副Agent确定性地获得项目的领域语言、已定架构决策与硬约束，
@@ -219,6 +223,31 @@ def _validate_structured_review(text: str) -> tuple[bool, str, str]:
 
     return True, json.dumps(arr, ensure_ascii=False), ""
 
+# delegate_research 使用的只读工具白名单（配合 default 权限模式）
+# 不再依赖 plan 模式，因为 plan 模式的"提案后等待人类审批"语义会导致 headless 单轮调研卡死
+# default 模式下用 allowed_tools 显式限定可调用工具；为防 CLI 版本差异导致默认权限破防，
+# 同时用 disallowed_tools 黑名单兜底，双重护栏
+_RESEARCH_TOOLS_LOCAL = [
+    "Read", "Grep", "Glob",
+    # 只读 Bash 子命令：plan 模式原本允许这些调研利器，切到 default 后需显式列出以免能力回归
+    "Bash(git log:*)", "Bash(git show:*)", "Bash(git blame:*)", "Bash(git diff:*)",
+    "Bash(ls:*)", "Bash(dir:*)", "Bash(find:*)", "Bash(wc:*)", "Bash(cat:*)",
+]
+_RESEARCH_TOOLS_WEB = list(_RESEARCH_TOOLS_LOCAL) + ["WebSearch", "WebFetch"]
+
+# 写操作工具黑名单：无论 allowed_tools 如何配置，这些工具一律拒绝
+# 防御 default 模式下 CLI 版本差异导致的权限边界漂移
+_DISALLOWED_TOOLS = ["Write", "Edit", "NotebookEdit", "Bash"]
+
+# 压制 plan/default 模式下副Agent"停下来等待审批"的行为
+# plan 模式的 propose-and-halt 语义是 Claude Code 系统级指令，仅靠 prompt 无法 100% 压制，
+# 故 delegate_research 已切换为 default 模式；此指令作为双保险，进一步明确要求直接输出结论
+_NO_HALT_NOTICE = (
+    "\n\n[执行要求] 请一次性完成全部调研并直接在回复中输出最终结论。"
+    "不要提交计划等待审批，不要中途停下来询问是否继续，"
+    "不要输出『等待审阅』或『请确认』之类的话。"
+)
+
 # 工具 1：delegate_research
 @mcp.tool()
 def delegate_research(
@@ -242,7 +271,7 @@ def delegate_research(
         project_dir: 副Agent的工作目录，必须传入当前项目根目录，以便副Agent读取该项目的CLAUDE.md共享记忆与docs/adr决策记录。不传则退回MCP所在目录，仅适合调试AgentParliament自身
         context_files: 可选，主Agent已定位的相关文件路径列表。会拼进提示词，引导副Agent优先阅读这些文件，避免从头扫描整个项目造成浪费
         allow_web: 可选，是否允许副Agent联网搜索（WebSearch/WebFetch）。默认False（仅本地代码调研）。
-            当调研问题涉及最新文档、版本特性、外部资料时设为True；副Agent仍处于只读plan模式，联网仅用于获取信息，不会改文件
+            当调研问题涉及最新文档、版本特性、外部资料时设为True；副Agent仍只读，联网仅用于获取信息，不会改文件
 
     Returns:
         副Agent的调研结论文本；若发生降级会在开头注明
@@ -264,9 +293,14 @@ def delegate_research(
         "4.【结论】对原始问题的直接回答\n"
         "5.【局限】本次调研可能遗漏的方面"
     )
+    # 单独追加：即使上方结构化指令被重构，no-halt 指令仍保留
+    prompt += _NO_HALT_NOTICE
 
-    # 联网搜索默认关闭，仅在主Agent显式开启时放开WebSearch/WebFetch这两个只读联网工具
-    allowed_tools = ["WebSearch", "WebFetch"] if allow_web else None
+    # 用 default 模式 + 显式只读工具白名单替代 plan 模式
+    # 原因：plan 模式的"调研→写计划文件→等待人类审批"语义会让 headless 单轮调研卡在"等待审阅"，
+    # 调研结论被困在 plan 文件里无法返回；default 模式下用 allowed_tools 限定只读，安全性等价且不会触发 halt
+    # disallowed_tools 作为黑名单兜底，防 default 模式下 CLI 版本差异导致默认权限破防
+    allowed_tools = list(_RESEARCH_TOOLS_WEB if allow_web else _RESEARCH_TOOLS_LOCAL)
 
     try:
         cwd = _resolve_cwd(project_dir)
@@ -276,6 +310,8 @@ def delegate_research(
             prompt=_memory_block(cwd) + prompt,
             cwd=cwd,
             allowed_tools=allowed_tools,
+            permission_mode="default",
+            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"

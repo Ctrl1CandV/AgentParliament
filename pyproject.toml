@@ -1,6 +1,6 @@
 [project]
 name = "agent-parliament"
-version = "1.3.0"
+version = "1.3.1"
 description = "一个 MCP 服务：让主Agent在必要时调用多个国内外模型做调研、代码审查、独立分析与多模型共识，所有副Agent均以只读模式运行。"
 requires-python = ">=3.10"
 dependencies = [
