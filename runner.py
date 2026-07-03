@@ -11,18 +11,48 @@ runner.py——AgentParliament的核心执行层
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 import subprocess
+import threading
 import tempfile
 import shutil
+import atexit
+import signal
 import json
+import sys
 import os
 
 PROFILES_PATH = Path(__file__).with_name("profiles.json")
 _DEBUG = os.environ.get("AGENTPARLIAMENT_DEBUG") == "1"
 _DEBUG_LOG = Path(__file__).with_name("logs") / "debug.log"
+
+# 跟踪当前运行中的子进程，MCP服务异常退出时由atexit钩子清理，避免孤儿进程持续消耗API额度
+# run_parallel会多线程并发调用_run_once，用id(proc)做key避免同名模型碰撞
+_PROCS_LOCK = threading.Lock()
+_RUNNING_PROCS: dict[int, subprocess.Popen] = {}
+
+def _register_proc(proc: subprocess.Popen) -> None:
+    """ 注册子进程到全局表，供atexit清理 """
+    with _PROCS_LOCK:
+        _RUNNING_PROCS[id(proc)] = proc
+
+def _unregister_proc(proc: subprocess.Popen) -> None:
+    """ 从全局表移除子进程 """
+    with _PROCS_LOCK:
+        _RUNNING_PROCS.pop(id(proc), None)
+
+def _cleanup_running_procs() -> None:
+    """ MCP服务退出时清理所有残留子进程，避免孤儿进程（best-effort，强杀场景不触发atexit） """
+    # 先在锁内复制并清空列表，释放锁后再逐个杀进程，避免taskkill阻塞工作线程
+    with _PROCS_LOCK:
+        procs = list(_RUNNING_PROCS.values())
+        _RUNNING_PROCS.clear()
+    for proc in procs:
+        _kill_process_tree(proc)
+
+atexit.register(_cleanup_running_procs)
 
 """
 每个model的独立CLAUDE_CONFIG_DIR根目录，放在临时目录避免污染用户~/.claude
@@ -291,6 +321,48 @@ def _classify_error(returncode: int, stderr: str) -> str:
         )
     return "未知错误"
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """
+    杀掉整个进程树，避免孤儿进程残留。
+    Windows用taskkill /T /F（/T=连子进程一起杀，/F=强制）；
+    Unix用killpg杀整个进程组（要求启动时设start_new_session=True）。
+    任何杀进程异常都吞掉，不影响主流程的降级链。
+    注意：Windows回退路径proc.kill()只杀主进程不杀子进程树，极端情况可能留孤儿。
+    """
+    if proc.poll() is not None:
+        return  # 已退出，无需清理
+    pid = proc.pid
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+            # taskkill返回非零（权限不足/PID刚消亡）时回退到proc.kill()
+            if result.returncode != 0:
+                proc.kill()
+        else:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:
+        # 兜底：尝试直接杀主进程
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """
+    标准子进程终止序列：杀进程树 → communicate排空管道并reap。
+    communicate的内部读线程在进程退出、管道关闭后自然结束，无需手动关管道。
+    这是subprocess官方文档推荐的超时后清理方式。
+    """
+    _kill_process_tree(proc)
+    try:
+        proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        # 极端情况：进程已杀但管道仍有残留数据未排空，放弃等待避免阻塞
+        pass
+
 def _run_once(
     profile: ModelProfile,
     prompt: str, cwd: str,
@@ -329,22 +401,50 @@ def _run_once(
     cmd.append("-p")
 
     env = profile.build_env(os.environ)
+    # 用Popen替代run，以便超时后能手动杀进程树（run超时后不杀子进程，会产生孤儿）；
+    # communicate()内部用线程分别读写stdout/stderr，避免管道缓冲区满导致的死锁。
+    # Unix下start_new_session=True让子进程成为新进程组组长，killpg才能杀整个进程组。
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=(sys.platform != "win32"),
+    )
+    _register_proc(proc)
+    stdout: str = ""
+    stderr: str = ""
     try:
-        completed = subprocess.run(
-            cmd, cwd=cwd, env=env,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
+        stdout, stderr = proc.communicate(
+            input=prompt, timeout=timeout_seconds
         )
     except subprocess.TimeoutExpired:
+        # 超时后必须杀进程树并排空管道，否则子进程变孤儿继续运行耗资源
+        _terminate_proc(proc)
         return AttemptResult(
             model_name=profile.name, ok=False,
             error=f"子进程超时>{timeout_seconds}s",
             error_type="超时",
         )
+    except Exception as exc:
+        # 非超时异常（BrokenPipeError/UnicodeDecodeError等）也杀进程树避免孤儿
+        _terminate_proc(proc)
+        return AttemptResult(
+            model_name=profile.name, ok=False,
+            error=f"子进程通信异常：{exc}",
+            error_type="未知错误",
+        )
+    finally:
+        _unregister_proc(proc)
+
+    # 构造CompletedProcess保持后续代码兼容（returncode/stdout/stderr访问方式不变）
+    completed = subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode,
+        stdout=stdout, stderr=stderr,
+    )
 
     if _DEBUG:
         # 落盘子进程真实结果与可能干扰claude的宿主环境变量，便于排查环境差异
@@ -400,16 +500,23 @@ def run_with_chain(
     attempts: list[AttemptResult] = []
     for model_name in config.roles[role]:
         profile = config.models[model_name]
-        attempt = _run_once(
-            profile=profile,
-            prompt=prompt,
-            cwd=cwd,
-            timeout_seconds=config.timeout_seconds,
-            extra_dirs=extra_dirs,
-            allowed_tools=allowed_tools,
-            permission_mode=permission_mode,
-            disallowed_tools=disallowed_tools,
-        )
+        try:
+            attempt = _run_once(
+                profile=profile,
+                prompt=prompt,
+                cwd=cwd,
+                timeout_seconds=config.timeout_seconds,
+                extra_dirs=extra_dirs,
+                allowed_tools=allowed_tools,
+                permission_mode=permission_mode,
+                disallowed_tools=disallowed_tools,
+            )
+        except Exception as exc:
+            # _run_once的非超时异常（BrokenPipeError等）不中断降级链，转成失败结果继续尝试下一个模型
+            attempt = AttemptResult(
+                model_name=model_name, ok=False,
+                error=f"执行时发生未预期异常：{exc}",
+            )
         attempts.append(attempt)
         if attempt.ok:
             return RunResult(
@@ -466,9 +573,43 @@ def run_parallel(
             executor.submit(_run_at_index, i, name): i
             for i, name in enumerate(model_names)
         }
-        for future in as_completed(futures):
-            index, attempt = future.result()
-            results[index] = attempt
+        # 总体超时：不超过单模型超时的1.5倍，避免一个慢模型拖垮整个并行批次
+        overall_timeout = int(config.timeout_seconds * 1.5)
+        done: set = set()
+        try:
+            for future in as_completed(futures, timeout=overall_timeout):
+                done.add(future)
+                index, attempt = future.result()
+                results[index] = attempt
+        except FuturesTimeoutError:
+            # as_completed超时抛TimeoutError，done中已完成的正常收集，未完成的需杀进程
+            pass
+
+        # 未完成的标记为超时失败，并主动杀掉仍在运行的子进程（否则会继续消耗API额度）
+        # 锁内快照后逐个检查poll()，避免误杀刚好完成但尚未unregister的进程（TOCTOU竞态）
+        with _PROCS_LOCK:
+            leftover_procs = list(_RUNNING_PROCS.values())
+        for proc in leftover_procs:
+            if proc.poll() is None:  # 仍在运行才杀
+                _terminate_proc(proc)
+
+        for future in futures:
+            if future not in done:
+                index = futures[future]
+                model_name = model_names[index]
+                # future可能刚好完成但未被yield，先检查拿真实结果
+                if future.done() and not future.cancelled():
+                    try:
+                        _, attempt = future.result()
+                        results[index] = attempt
+                        continue
+                    except Exception:
+                        pass
+                results[index] = AttemptResult(
+                    model_name=model_name, ok=False,
+                    error=f"并行批次整体超时>{overall_timeout}s",
+                    error_type="超时",
+                )
 
     total_cost = sum(r.cost_usd or 0.0 for r in results)
     return ParallelResult(results=results, total_cost_usd=total_cost)
