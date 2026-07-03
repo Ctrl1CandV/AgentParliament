@@ -35,7 +35,9 @@ from runner import (
 )
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
+import asyncio
 import json
+import re
 import sys
 mcp = FastMCP("AgentParliament")
 
@@ -131,13 +133,125 @@ _MEMORY_FILENAME = "CLAUDE.md"
 # 注入记忆体的字符上限，防止异常膨胀的记忆体挤占prompt预算；超出时截断并提示
 _MEMORY_CHAR_LIMIT = 16000
 
+# SPEC.md 和 ADR 增量注入的字符上限，防止挤占 prompt 预算
+_SPEC_BRIEF_LIMIT = 800
+_ADR_INDEX_LIMIT = 400
+
+# SPEC.md 固定二级标题名，用于标题匹配提取进度/下一步（与提示词侧约定一致）
+_SPEC_HEADINGS = ("## 执行方案", "## 进度", "## 下一步")
+
+# 匹配 CLAUDE.md 中的 ADR 索引行，如 "[ADR-001] 选用 asyncio.to_thread 解决事件循环阻塞"
+_ADR_INDEX_PATTERN = re.compile(r"^\[ADR-\d+[^\]]*\].*$", re.MULTILINE)
+
+
+def _extract_spec_brief(cwd: str) -> str:
+    """
+    从 SPEC.md 提取最新进度末条 + 下一步首行，作为轻量执行上下文注入副 Agent。
+    用固定二级标题（## 进度 / ## 下一步）做匹配，而非脆弱的行数截取。
+    best-effort：文件不存在、标题不匹配、读取失败都返回空串。
+    """
+    spec_path = Path(cwd) / "SPEC.md"
+    try:
+        if not spec_path.is_file():
+            return ""
+        text = spec_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+    lines = text.splitlines()
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in lines:
+        # 检测二级标题行
+        if line.strip().startswith("## "):
+            heading = line.strip()
+            if heading in _SPEC_HEADINGS:
+                current = heading
+                sections[current] = []
+            else:
+                current = None  # 遇到非约定标题，退出当前段
+        elif current is not None:
+            sections[current].append(line)
+
+    parts: list[str] = []
+
+    # 进度段：取最后一条非空列表项
+    progress_lines = sections.get("## 进度", [])
+    # 从末尾向前找最后一条非空、非纯标线的列表项
+    last_progress = ""
+    for line in reversed(progress_lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("---") and not stripped.startswith("###"):
+            # 优先取列表项（- [x] 或 - [ ] 开头），也接受普通非空行
+            if stripped.startswith("- ") or stripped.startswith("- ["):
+                last_progress = stripped
+                break
+            # 如果不是列表项但非空，也作为 fallback
+            if not last_progress:
+                last_progress = stripped
+    if last_progress:
+        parts.append(f"[执行进度] {last_progress}")
+
+    # 下一步段：取第一条非空、非纯标线行
+    next_lines = sections.get("## 下一步", [])
+    first_next = ""
+    for line in next_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("---") and not stripped.startswith("###"):
+            first_next = stripped
+            break
+    if first_next:
+        parts.append(f"[下一步] {first_next}")
+
+    if not parts:
+        return ""
+
+    brief = " | ".join(parts)
+    if len(brief) > _SPEC_BRIEF_LIMIT:
+        brief = brief[:_SPEC_BRIEF_LIMIT] + "…（截断）"
+    return f"\n[执行上下文] {brief}\n"
+
+
+def _extract_adr_index(cwd: str, claude_md_content: str) -> str:
+    """
+    提取 ADR 索引，优先从 CLAUDE.md 内容中提取 [ADR-XXX] 索引行（语义密度高），
+    无索引时 fallback 到 docs/adr/ 目录列文件名。
+    best-effort：无索引、无目录都返回空串。
+    """
+    # 优先从 CLAUDE.md 提取 ADR 索引行
+    matches = _ADR_INDEX_PATTERN.findall(claude_md_content)
+    if matches:
+        index_text = "; ".join(matches)
+        if len(index_text) > _ADR_INDEX_LIMIT:
+            index_text = index_text[:_ADR_INDEX_LIMIT] + "…（完整列表见 docs/adr/）"
+        return f"\n[架构决策] {index_text}\n"
+
+    # fallback：扫描 docs/adr/ 目录
+    adr_dir = Path(cwd) / "docs" / "adr"
+    try:
+        if not adr_dir.is_dir():
+            return ""
+        adr_files = sorted(adr_dir.glob("*.md"))
+        if not adr_files:
+            return ""
+        names = [f.stem for f in adr_files]  # 文件名去 .md 后缀
+        index_text = "; ".join(names)
+        if len(index_text) > _ADR_INDEX_LIMIT:
+            index_text = index_text[:_ADR_INDEX_LIMIT] + "…（完整列表见 docs/adr/）"
+        return f"\n[架构决策] 可查阅 docs/adr/：{index_text}\n"
+    except Exception:
+        return ""
+
+
 def _memory_block(cwd: str) -> str:
     """
-    从副Agent工作目录读取共享记忆体（CLAUDE.md），渲染成注入prompt开头的记忆块
+    从副Agent工作目录读取共享记忆体（CLAUDE.md），渲染成注入prompt开头的记忆块。
+    同时追加 SPEC.md 执行上下文（进度末条+下一步首行）和 ADR 索引，形成回读闭环。
     设计要点：
     - 显式读取而非依赖Claude Code自动加载，确保被调用的副Agent确定性地获得项目记忆
     - 记忆体是best-effort：文件不存在或读取失败都返回空串，绝不让记忆问题阻断工具主流程
     - 超过字符上限时截断，避免异常膨胀的记忆体挤占prompt
+    - SPEC/ADR 增量是注入到prompt文本中，不是指令副Agent去读文件，不与 _MATERIAL_NOTICE 冲突
     返回值要么是空串，要么是带引导语和分隔符的完整记忆块
     """
     memory_path = Path(cwd) / _MEMORY_FILENAME
@@ -158,6 +272,10 @@ def _memory_block(cwd: str) -> str:
             + "\n…（项目记忆超过长度上限已截断，完整内容见项目CLAUDE.md）"
         )
 
+    # 追加 SPEC.md 执行上下文和 ADR 索引（回读闭环的核心）
+    spec_brief = _extract_spec_brief(cwd)
+    adr_index = _extract_adr_index(cwd, content)
+
     return (
         "[项目记忆] 以下是本项目的共享记忆体（CLAUDE.md），"
         "包含领域语言、已定架构决策、硬约束与当前状态。\n"
@@ -165,7 +283,8 @@ def _memory_block(cwd: str) -> str:
         "若你的分析与记忆体存在矛盾，请明确指出而非默默忽略。\n"
         "————（项目记忆开始）————\n"
         f"{content}\n"
-        "————（项目记忆结束）————\n\n"
+        "————（项目记忆结束）————\n"
+        f"{spec_brief}{adr_index}\n"
     )
 
 def _project_dir_warning(project_dir: str | None) -> str:
@@ -250,7 +369,7 @@ _NO_HALT_NOTICE = (
 
 # 工具 1：delegate_research
 @mcp.tool()
-def delegate_research(
+async def delegate_research(
     question: str, role: str = "researcher",
     project_dir: str | None = None,
     context_files: list[str] | None = None,
@@ -304,7 +423,8 @@ def delegate_research(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        result = run_with_chain(
+        result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -320,7 +440,7 @@ def delegate_research(
 
 # 工具 2：peer_review
 @mcp.tool()
-def peer_review(
+async def peer_review(
     diff: str, role: str = "reviewer",
     focus: str = "", project_dir: str | None = None,
     context_files: list[str] | None = None,
@@ -402,7 +522,8 @@ def peer_review(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        result = run_with_chain(
+        result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -432,7 +553,7 @@ def peer_review(
 
 # 工具 3：independent_analysis
 @mcp.tool()
-def independent_analysis(
+async def independent_analysis(
     original_task: str,
     existing_result: str,
     concern: str = "",
@@ -484,7 +605,8 @@ def independent_analysis(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        result = run_with_chain(
+        result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -497,7 +619,7 @@ def independent_analysis(
 
 # 工具 4：consensus
 @mcp.tool()
-def consensus(
+async def consensus(
     question: str,
     role: str = "third_party",
     project_dir: str | None = None,
@@ -550,7 +672,8 @@ def consensus(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        parallel = run_parallel(
+        parallel = await asyncio.to_thread(
+            run_parallel,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -597,7 +720,8 @@ def consensus(
     )
 
     try:
-        synth_result = run_with_chain(
+        synth_result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=aggregator_role,
             prompt=_memory_block(cwd) + synth_prompt,
@@ -639,7 +763,7 @@ def consensus(
 
 # 工具 5：validate_approach
 @mcp.tool()
-def validate_approach(
+async def validate_approach(
     approach: str,
     goal: str = "",
     role: str = "third_party",
@@ -686,7 +810,8 @@ def validate_approach(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        result = run_with_chain(
+        result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -699,7 +824,7 @@ def validate_approach(
 
 # 工具 6：test_audit
 @mcp.tool()
-def test_audit(
+async def test_audit(
     source_files: list[str],
     test_files: list[str] | None = None,
     focus: str = "", role: str = "reviewer",
@@ -765,7 +890,8 @@ def test_audit(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        result = run_with_chain(
+        result = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=role,
             prompt=_memory_block(cwd) + prompt,
@@ -782,7 +908,7 @@ _NEED_ADVISOR_TAG = "[NEED_ADVISOR]"
 
 # 工具 7：advisor_analysis
 @mcp.tool()
-def advisor_analysis(
+async def advisor_analysis(
     task: str,
     draft_role: str = "researcher",
     advisor_role: str = "advisor",
@@ -826,7 +952,8 @@ def advisor_analysis(
 
     try:
         cwd = _resolve_cwd(project_dir)
-        draft = run_with_chain(
+        draft = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=draft_role,
             prompt=_memory_block(cwd) + draft_prompt,
@@ -854,7 +981,8 @@ def advisor_analysis(
     )
 
     try:
-        advisor = run_with_chain(
+        advisor = await asyncio.to_thread(
+            run_with_chain,
             config=_get_config(),
             role=advisor_role,
             prompt=_memory_block(cwd) + advisor_prompt,

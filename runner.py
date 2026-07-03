@@ -21,6 +21,7 @@ import shutil
 import atexit
 import signal
 import json
+import time
 import sys
 import os
 
@@ -107,6 +108,11 @@ class Config:
     timeout_seconds: int
     models: dict[str, ModelProfile]
     roles: dict[str, list[str]]
+    role_overrides: dict[str, int] = field(default_factory=dict)
+
+    def timeout_for(self, role: str) -> int:
+        """ 按角色取超时：有覆盖用覆盖，否则用默认值 """
+        return self.role_overrides.get(role, self.timeout_seconds)
 
 @dataclass
 class AttemptResult:
@@ -166,6 +172,13 @@ def load_config(path: Path = PROFILES_PATH) -> Config:
 
     defaults = raw.get("defaults", {})
     timeout_seconds = int(defaults.get("timeout_seconds", 300))
+    role_overrides_raw = defaults.get("role_overrides", {})
+    role_overrides: dict[str, int] = {}
+    for role_name, ts in role_overrides_raw.items():
+        try:
+            role_overrides[role_name] = int(ts)
+        except (ValueError, TypeError):
+            pass  # 非法值静默跳过，不阻断加载
 
     raw_models = raw.get("models", {})
     if not raw_models:
@@ -201,6 +214,7 @@ def load_config(path: Path = PROFILES_PATH) -> Config:
         timeout_seconds=timeout_seconds,
         models=models,
         roles=roles,
+        role_overrides=role_overrides,
     )
 
 def _debug_log(message: str) -> None:
@@ -491,21 +505,36 @@ def run_with_chain(
     disallowed_tools: list[str] | None = None,
 ) -> RunResult:
     """
-    按角色失败链依次尝试，第一个成功即返回；全部失败则返回失败结果
-    因为只读任务幂等，降级重跑是安全的
+    按角色失败链依次尝试，第一个成功即返回；全部失败则返回失败结果。
+    因为只读任务幂等，降级重跑是安全的。
+
+    熔断器集成：
+    - 链上被熔断的模型自动跳过（冷却期内不尝试），记录为"熔断跳过"
+    - 只有明确的"模型不可用"类错误（鉴权/限流/网络/模型ID）才计入熔断失败计数
+    - 超时和未知错误不计入——超时可能是模型在认真思考，不代表"模型挂了"
+    - 成功一次即清零该模型的失败计数
     """
     if role not in config.roles:
         raise ProfileError(f"未定义的角色'{role}'")
 
     attempts: list[AttemptResult] = []
     for model_name in config.roles[role]:
+        # 熔断器：跳过冷却期内的模型
+        if _circuit_is_open(model_name):
+            attempts.append(AttemptResult(
+                model_name=model_name, ok=False,
+                error=f"模型被熔断跳过（连续失败≥{_CIRCUIT_FAILURE_THRESHOLD}次，冷却中）",
+                error_type="熔断跳过",
+            ))
+            continue
+
         profile = config.models[model_name]
         try:
             attempt = _run_once(
                 profile=profile,
                 prompt=prompt,
                 cwd=cwd,
-                timeout_seconds=config.timeout_seconds,
+                timeout_seconds=config.timeout_for(role),
                 extra_dirs=extra_dirs,
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
@@ -518,13 +547,20 @@ def run_with_chain(
                 error=f"执行时发生未预期异常：{exc}",
             )
         attempts.append(attempt)
+
         if attempt.ok:
+            # 成功：清零该模型的熔断失败计数
+            _circuit_record_success(model_name)
             return RunResult(
                 ok=True,
                 text=attempt.text,
                 model_used=model_name,
                 attempts=attempts,
             )
+
+        # 失败：只有"模型不可用"类错误才计入熔断
+        if _circuit_should_trip(attempt.error_type):
+            _circuit_record_failure(model_name)
 
     # 链上所有模型都失败了
     return RunResult(ok=False, text="", model_used=None, attempts=attempts)
@@ -554,7 +590,7 @@ def run_parallel(
                 profile=profile,
                 prompt=prompt,
                 cwd=cwd,
-                timeout_seconds=config.timeout_seconds,
+                timeout_seconds=config.timeout_for(role),
                 extra_dirs=extra_dirs,
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
@@ -574,7 +610,7 @@ def run_parallel(
             for i, name in enumerate(model_names)
         }
         # 总体超时：不超过单模型超时的1.5倍，避免一个慢模型拖垮整个并行批次
-        overall_timeout = int(config.timeout_seconds * 1.5)
+        overall_timeout = int(config.timeout_for(role) * 1.5)
         done: set = set()
         try:
             for future in as_completed(futures, timeout=overall_timeout):
@@ -613,6 +649,64 @@ def run_parallel(
 
     total_cost = sum(r.cost_usd or 0.0 for r in results)
     return ParallelResult(results=results, total_cost_usd=total_cost)
+
+
+# ─── 轻量熔断器 ───────────────────────────────────────────
+# 进程内维护每个模型的连续失败计数，达到阈值后在冷却期内直接跳过该模型，
+# 避免对已知不可用的模型反复等满超时。成功一次即清零。
+# 设计取舍：不做持久化、不做跨进程共享，仅在单个MCP服务进程生命周期内有效，
+# 适合应对"某模型临时挂了几分钟"的场景；重启MCP服务自然清零。
+
+_CIRCUIT_LOCK = threading.Lock()
+# 结构：{model_name: {"failures": int, "cooldown_until": float}}
+_CIRCUIT_STATE: dict[str, dict] = {}
+_CIRCUIT_FAILURE_THRESHOLD = 3  # 连续失败3次后熔断
+_CIRCUIT_COOLDOWN_SECONDS = 300  # 熔断后冷却5分钟
+
+# 只有这些 error_type 才计入熔断失败计数。
+# 超时和未知错误不计入——超时可能是模型在认真思考，未知错误可能是管道抖动，都不代表"模型挂了"。
+_CIRCUIT_TRIPPABLE_ERRORS = frozenset({
+    "鉴权失败", "额度/限流", "模型ID无效", "网络连接",
+})
+
+
+def _circuit_should_trip(error_type: str | None) -> bool:
+    """判断该 error_type 是否应计入熔断失败计数。只有明确的'模型不可用'类错误才计入。"""
+    return error_type is not None and error_type in _CIRCUIT_TRIPPABLE_ERRORS
+
+
+def _circuit_is_open(model_name: str) -> bool:
+    """该模型是否被熔断（冷却期内直接跳过）"""
+    with _CIRCUIT_LOCK:
+        state = _CIRCUIT_STATE.get(model_name)
+        if state is None:
+            return False
+        cooldown_until = state.get("cooldown_until", 0)
+        if cooldown_until > 0:
+            if time.monotonic() < cooldown_until:
+                return True
+            # 冷却期已过：重置该模型状态（清零失败计数，给模型重新开始的机会）
+            _CIRCUIT_STATE.pop(model_name, None)
+            return False
+        # cooldown_until=0 表示有失败记录但未达熔断阈值，不阻塞，也不清除计数
+        return False
+
+
+def _circuit_record_failure(model_name: str) -> None:
+    """记录一次失败，达到阈值后开启熔断"""
+    with _CIRCUIT_LOCK:
+        state = _CIRCUIT_STATE.setdefault(model_name, {"failures": 0, "cooldown_until": 0})
+        state["failures"] += 1
+        if state["failures"] >= _CIRCUIT_FAILURE_THRESHOLD:
+            state["cooldown_until"] = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
+            _debug_log(f"[熔断器] 模型 {model_name} 连续失败 {state['failures']} 次，熔断 {_CIRCUIT_COOLDOWN_SECONDS}s")
+
+
+def _circuit_record_success(model_name: str) -> None:
+    """记录一次成功，清零失败计数"""
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_STATE.pop(model_name, None)
+
 
 def health_check(config: Config) -> list[str]:
     """

@@ -10,6 +10,7 @@ profiles.json
 .DS_Store
 .claude/
 CLAUDE.md
+SPEC.md
 Thumbs.db
 
 logs/

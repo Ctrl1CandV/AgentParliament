@@ -2,7 +2,12 @@
   "_readme": "模型与角色配置，token为敏感信息，请勿提交到git。models定义每个模型的Anthropic兼容端点；roles定义每个角色的失败链。",
 
   "defaults": {
-    "timeout_seconds": 300
+    "timeout_seconds": 300,
+    "role_overrides": {
+      "reviewer": 120,
+      "third_party": 180,
+      "researcher": 300
+    }
   },
 
   "models": {
