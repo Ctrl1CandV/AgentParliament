@@ -34,15 +34,28 @@ _DEBUG_LOG = Path(__file__).with_name("logs") / "debug.log"
 _PROCS_LOCK = threading.Lock()
 _RUNNING_PROCS: dict[int, subprocess.Popen] = {}
 
-def _register_proc(proc: subprocess.Popen) -> None:
-    """ 注册子进程到全局表，供atexit清理 """
+# run_parallel批次登记表类型：(该批次自己的锁, 该批次自己的{id(proc): proc}表)
+# 让run_parallel的超时清理只能看到、只能杀掉自己这一批的子进程，
+# 而不会误杀同一时刻由其他并发MCP工具调用（如另一个delegate_research）注册在全局表里的子进程
+BatchRegistry = tuple[threading.Lock, dict[int, subprocess.Popen]]
+
+def _register_proc(proc: subprocess.Popen, batch: BatchRegistry | None = None) -> None:
+    """ 注册子进程到全局表（供atexit清理），batch非空时同时登记到调用方批次表 """
     with _PROCS_LOCK:
         _RUNNING_PROCS[id(proc)] = proc
+    if batch is not None:
+        batch_lock, batch_procs = batch
+        with batch_lock:
+            batch_procs[id(proc)] = proc
 
-def _unregister_proc(proc: subprocess.Popen) -> None:
-    """ 从全局表移除子进程 """
+def _unregister_proc(proc: subprocess.Popen, batch: BatchRegistry | None = None) -> None:
+    """ 从全局表移除子进程，batch非空时同时从调用方批次表移除 """
     with _PROCS_LOCK:
         _RUNNING_PROCS.pop(id(proc), None)
+    if batch is not None:
+        batch_lock, batch_procs = batch
+        with batch_lock:
+            batch_procs.pop(id(proc), None)
 
 def _cleanup_running_procs() -> None:
     """ MCP服务退出时清理所有残留子进程，避免孤儿进程（best-effort，强杀场景不触发atexit） """
@@ -385,6 +398,7 @@ def _run_once(
     allowed_tools: list[str] | None = None,
     permission_mode: str = "plan",
     disallowed_tools: list[str] | None = None,
+    batch: BatchRegistry | None = None,
 ) -> AttemptResult:
     """
     用指定模型profile启动一次只读子进程并返回结果
@@ -428,7 +442,7 @@ def _run_once(
         errors="replace",
         start_new_session=(sys.platform != "win32"),
     )
-    _register_proc(proc)
+    _register_proc(proc, batch=batch)
     stdout: str = ""
     stderr: str = ""
     try:
@@ -452,7 +466,7 @@ def _run_once(
             error_type="未知错误",
         )
     finally:
-        _unregister_proc(proc)
+        _unregister_proc(proc, batch=batch)
 
     # 构造CompletedProcess保持后续代码兼容（returncode/stdout/stderr访问方式不变）
     completed = subprocess.CompletedProcess(
@@ -467,7 +481,14 @@ def _run_once(
             "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
             "CLAUDE_CONFIG_DIR", "HTTP_PROXY", "HTTPS_PROXY",
         ]
-        env_dump = {k: env.get(k) for k in suspect_keys if env.get(k) is not None}
+        # 凭据类变量脱敏后再落盘，避免明文 token 写入 logs/debug.log 造成泄露
+        # （mcp.config.json 可能把 AGENTPARLIAMENT_DEBUG 置 1，默认即开启日志）
+        _SENSITIVE_KEYS = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
+        env_dump = {
+            k: (f"***（已脱敏，长度{len(env[k])}）" if k in _SENSITIVE_KEYS else env[k])
+            for k in suspect_keys
+            if env.get(k) is not None
+        }
         _debug_log(
             f"--- model={profile.name} cwd={cwd} ---\n"
             f"returncode={completed.returncode}\n"
@@ -583,6 +604,9 @@ def run_parallel(
     model_names = config.roles[role]
     results: list[AttemptResult] = [None] * len(model_names)
 
+    # 本批次自己的进程登记表：超时清理只杀这一批的子进程，不碰全局表里其他并发调用（如另一个delegate_research）注册的进程
+    batch: BatchRegistry = (threading.Lock(), {})
+
     def _run_at_index(index: int, model_name: str) -> tuple[int, AttemptResult]:
         try:
             profile = config.models[model_name]
@@ -595,6 +619,7 @@ def run_parallel(
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
                 disallowed_tools=disallowed_tools,
+                batch=batch,
             )
         except Exception as exc:
             # 单个模型的意外异常不应拖垮整个并行批次，转成失败结果以保持run_parallel"各模型互不影响"的契约
@@ -622,9 +647,11 @@ def run_parallel(
             pass
 
         # 未完成的标记为超时失败，并主动杀掉仍在运行的子进程（否则会继续消耗API额度）
+        # 只读本批次的登记表，不碰全局_RUNNING_PROCS——避免误杀同一时刻由其他并发MCP工具调用注册的子进程
         # 锁内快照后逐个检查poll()，避免误杀刚好完成但尚未unregister的进程（TOCTOU竞态）
-        with _PROCS_LOCK:
-            leftover_procs = list(_RUNNING_PROCS.values())
+        batch_lock, batch_procs = batch
+        with batch_lock:
+            leftover_procs = list(batch_procs.values())
         for proc in leftover_procs:
             if proc.poll() is None:  # 仍在运行才杀
                 _terminate_proc(proc)

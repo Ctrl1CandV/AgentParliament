@@ -1,6 +1,6 @@
 [project]
 name = "agent-parliament"
-version = "1.4.0"
+version = "1.5.0"
 description = "一个 MCP 服务：让主Agent在必要时调用多个国内外模型做调研、代码审查、独立分析与多模型共识，所有副Agent均以只读模式运行。"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,9 +14,6 @@ agent-parliament = "server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# 本项目是单文件模块，显式告诉hatchling把这两个模块作为打包内容，避免它按包目录结构去猜
+# 扁平多模块结构，用通配符一次性包含所有顶层 .py，新增模块无需维护此列表
 [tool.hatch.build.targets.wheel]
-include = [
-    "server.py",
-    "runner.py",
-]
+include = ["*.py"]

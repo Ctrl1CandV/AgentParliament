@@ -1,5 +1,5 @@
 {
-  "_comment": "把mcpServers下的内容粘贴到Trae的MCP配置里。uv会自动根据pyproject.toml创建隔离环境并安装依赖，无需手动pip install，也无需填python解释器绝对路径。前提：已安装uv与Claude Code CLI，并已在项目目录内填好profiles.json",
+  "_comment": "把mcpServers下的内容粘贴到Trae的MCP配置里。uv会自动根据pyproject.toml创建隔离环境并安装依赖，无需手动pip install，也无需填python解释器绝对路径。前提：已安装uv与Claude Code CLI，并已在项目目录内填好profiles.json。如需排查问题，在下面加 \"env\": {\"AGENTPARLIAMENT_DEBUG\": \"1\"} 开启调试日志（写入 logs/debug.log，凭据字段已脱敏）",
 
   "mcpServers": {
     "AgentParliament": {
@@ -9,10 +9,7 @@
         "--directory",
         "d:\\Liu Project\\AgentParliament",
         "agent-parliament"
-      ],
-      "env": {
-        "AGENTPARLIAMENT_DEBUG": "1"
-      }
+      ]
     }
   }
 }
