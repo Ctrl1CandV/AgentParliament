@@ -1,7 +1,7 @@
 """
 server.py——AgentParliament的MCP入口
 
-通过stdio暴露8个工具给主Agent：
+通过stdio暴露9个工具给主Agent：
 1. delegate_research   —— 调研：把问题与相关文件交给副模型调研，回传结论
 2. peer_review         —— 代码审查：把git diff交给副模型审查，回传分级问题
 3. independent_analysis—— 独立分析：让第三方模型批判性审视已有结论，找盲区与漏洞
@@ -10,6 +10,7 @@ server.py——AgentParliament的MCP入口
 6. test_audit          —— 测试审计：静态分析源码与测试，找出未覆盖的逻辑分支与边界
 7. advisor_analysis    —— 战略求助：中等模型先出草稿，不确定或高风险时条件升级求助强模型
 8. delegate_chain      —— 多步推理链：主Agent定义多步思维链结构，server.py依次执行；链内子Agent可全文件读取
+9. delegate_dialogue   —— 带对话能力的调研：子Agent可通过[ASK_PARENT]标记向主Agent提问，主Agent带session_id+answer续答
 
 所有工具的副Agent都以只读模式运行，不会修改任何文件；改文件的动作始终留在主进程，由用户审阅后执行
 - peer_review / independent_analysis / consensus / validate_approach / test_audit / advisor_analysis：
@@ -60,6 +61,7 @@ from chain import (
     _RESEARCH_TOOLS_LOCAL,
     _RESEARCH_TOOLS_WEB,
     _execute_delegate_chain,
+    _execute_delegate_dialogue,
     _extra_dirs_from_files,
     _get_config,
     _resolve_cwd,
@@ -575,6 +577,49 @@ async def delegate_chain(
         最终结论无论是否synthesize都为最后一步的输出（synthesize=True 时为综合步骤输出）
     """
     return await _execute_delegate_chain(task, stages, project_dir, synthesize, aggregator_role)
+
+# 工具 9：delegate_dialogue
+@mcp.tool()
+async def delegate_dialogue(
+    question: str = "",
+    project_dir: str = "",
+    role: str = "researcher",
+    context_files: list[str] | None = None,
+    allow_web: bool = False,
+    session_id: str = "",
+    answer: str = "",
+    max_dialogue: int = 3,
+) -> str:
+    """
+    带对话能力的调研：子Agent在调研中途遇到需主Agent确认的方向时，可输出 [ASK_PARENT] 提问结束本轮；
+    主Agent带 session_id+answer 再次调用，子Agent继续同一任务，形成"提问→回答→继续"闭环。
+
+    与 delegate_research 的区别：delegate_research 是单轮 fire-and-forget，子Agent不能中途提问；
+    本工具支持多轮接力对话，适合调研中存在方向性分歧、需主Agent拍板的场景。
+    日常调研仍用 delegate_research，仅当预期调研中可能需要确认方向时用本工具。
+
+    [使用前提] 调用前你已对问题形成初步判断。本工具用子Agent的独立视角交叉验证，而非替你做判断。
+    子Agent的提问由你回答——你是决策方，不要把提问当作免思考的现成答案。
+
+    Args:
+        question: 要副Agent回答的调研问题，首次调用必填，续答时忽略
+        project_dir: 副Agent工作目录，首次调用必填（对话需读取项目CLAUDE.md记忆体）；续答时从 session 取
+        role: 使用哪条角色失败链，默认"researcher"
+        context_files: 可选，主Agent已定位的相关文件路径列表，引导副Agent优先阅读
+        allow_web: 可选，是否允许副Agent联网搜索，默认False
+        session_id: 续答时传——首次调用返回的 session_id，用于接续对话上下文
+        answer: 续答时必填——你对上一轮子Agent提问的回答
+        max_dialogue: 最大对话轮数（含首轮），默认3，达上限后取子Agent当前结论结束，防无限循环
+
+    Returns:
+        首次/续答·子Agent提问时：含待确认问题+子Agent当前结论+session_id，提示你带 answer 续答
+        对话结束时：子Agent最终结论+对话历史
+        失败时：降级/失败尝试记录
+    """
+    return await _execute_delegate_dialogue(
+        question, project_dir, role, context_files, allow_web,
+        session_id, answer, max_dialogue,
+    )
 
 def main() -> None:
     """ 以stdio方式启动MCP服务，供命令行入口（pyproject.toml的scripts）与直接运行共用 """

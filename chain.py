@@ -1,13 +1,15 @@
 """
-chain.py——AgentParliament的链调度核心与共享辅助
+chain.py——AgentParliament的链调度核心、delegate_dialogue session 管理与共享辅助
 
 职责：
 1. _call_tool_by_name：内部工具调度器，按原子工具名执行并返回结构化dict
    （供delegate_chain复用prompt纯函数与run_with_chain，保证单工具调用与链内调用产出一致）
 2. _execute_delegate_chain：delegate_chain的编排逻辑
-   （stage循环、占位符替换、自动填充、stage参数校验、synthesize综合、结果渲染）
+   （stage循环、占位符替换、自动填充、stage参数校验、synthesize综合、结果渲染、动态超时）
 3. _run_synthesize：synthesize综合步骤
-4. 共享辅助：_get_config（延迟加载缓存）、_resolve_cwd、_extra_dirs_from_files、工具白/黑名单
+4. _execute_delegate_dialogue：delegate_dialogue的编排逻辑
+   （新建/续答分流、子Agent一轮、提问检测/续答接力、session管理）
+5. 共享辅助：_get_config（延迟加载缓存）、_resolve_cwd、_extra_dirs_from_files、工具白/黑名单
 
 本模块不import server（避免循环依赖），server.py与chain.py所需共享辅助均在本模块定义。
 """
@@ -15,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
+import time
 import sys
+import uuid
 from pathlib import Path
 
 from runner import (
@@ -37,6 +42,9 @@ from prompts import (
     _memory_block,
     _NEED_ADVISOR_TAG,
     _READONLY_NOTICE,
+    _build_dialogue_continue_prompt,
+    _build_dialogue_prompt,
+    detect_ask_parent,
 )
 from render import (
     _chain_error,
@@ -45,6 +53,9 @@ from render import (
     _render_chain_result,
     _truncate_for_chain,
     _validate_structured_review,
+    _format_ask_response,
+    _format_dialogue_final,
+    _format_result,
 )
 
 # prompt改由stdin传入后已无命令行长度限制，此处仅保留一个宽松上限防止极端输入耗尽内存
@@ -99,6 +110,14 @@ _RESEARCH_TOOLS_LOCAL = [
     "Bash(ls:*)", "Bash(dir:*)", "Bash(find:*)", "Bash(wc:*)", "Bash(cat:*)",
 ]
 _RESEARCH_TOOLS_WEB = list(_RESEARCH_TOOLS_LOCAL) + ["WebSearch", "WebFetch"]
+
+# delegate_chain动态超时计算的膨胀系数增量。
+# 越靠后的步骤要处理越多累积信息（__PREVIOUS_RESULT__），实际耗时越长。
+# 第 i 步（从0开始）的膨胀系数 = 1.0 + i * INFLATION_FACTOR。
+# 例如3步链路：1.0 + 1.15 + 1.3 = 3.45倍基础超时（对比简单求和的3.0倍）
+# 推导依据：__PREVIOUS_RESULT__ 在 step i 时约为 step 0 的 (i+1) 倍长度，子 Agent 处理耗时
+# 线性增长，实测 5 步链路每步增加约 10-20%，取中值 15%
+INFLATION_FACTOR = 0.15
 
 # 写操作工具黑名单：无论allowed_tools如何配置，这些工具一律拒绝
 _DISALLOWED_TOOLS = ["Write", "Edit", "NotebookEdit", "Bash"]
@@ -319,6 +338,44 @@ async def _call_tool_by_name(
 # delegate_chain 校验 stage 参数用的合法参数集合，与 _call_tool_by_name 签名自动同步
 _CALL_TOOL_KWARGS = frozenset(inspect.signature(_call_tool_by_name).parameters) - {"tool_name"}
 
+def calculate_chain_timeout(
+    stages: list[dict], config: Config,
+    synthesizer_role: str | None = None,
+) -> float:
+    """
+    计算delegate_chain的动态总超时阈值
+
+    公式：total = Σ stage_timeout_i + optional synth_timeout
+    其中 stage_timeout_i = base_timeout(stage_i.role) × chain_overhead(role_i) × (1.0 + i × INFLATION_FACTOR)
+    chain_overhead = min(角色链长度, 2)（保守估算最多降级一次，首选模型通常可用）
+
+    设计思路：
+    - 越靠后的步骤要处理越多累积信息（__PREVIOUS_RESULT__），实际耗时越长
+    - 前面的步骤：系数 ≈ 1.0（直接用基础超时）
+    - 后面的步骤：系数线性递增（1.0 + i × 0.15）
+    - 角色链重试开销：失败降级时串行尝试多个模型，保守估算最多降级一次
+    - 基础超时取自 profiles.json 的 role_overrides / timeout_seconds
+    """
+    total = 0.0
+    for i, stage in enumerate(stages):
+        role = stage.get("role") or "third_party"
+        base_timeout = config.timeout_for(role)
+        # 角色链重试开销：min(链长, 2) 表示保守估算最多降级一次
+        role_chain_len = len(config.roles.get(role, []))
+        chain_overhead = min(role_chain_len, 2)
+        coefficient = 1.0 + i * INFLATION_FACTOR
+        total += base_timeout * chain_overhead * coefficient
+
+    # synthesize 步骤位于所有 stages 之后，系数最高
+    if synthesizer_role:
+        synth_base = config.timeout_for(synthesizer_role)
+        synth_chain_len = len(config.roles.get(synthesizer_role, []))
+        synth_overhead = min(synth_chain_len, 2)
+        synth_coefficient = 1.0 + len(stages) * INFLATION_FACTOR
+        total += synth_base * synth_overhead * synth_coefficient
+
+    return total
+
 async def _run_synthesize(
     task: str,
     results: list[dict],
@@ -352,6 +409,10 @@ async def _run_synthesize(
             cwd=cwd,
             # cwd 已是 project_dir，子 Agent 本就能读取项目文件，无需额外 --add-dir
             extra_dirs=None,
+            # synthesize 综合步骤用 default + 只读白名单，避免 plan 模式的 "propose-and-halt" 语义让 headless 子 Agent 卡在 "等待审批"
+            allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+            permission_mode="default",
+            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return _chain_error(str(exc))
@@ -386,10 +447,31 @@ async def _execute_delegate_chain(
         return f"[AgentParliament] 配置或调用错误：{exc}"
     chain_memory = _memory_block(chain_cwd)
 
+    # 计算动态总超时阈值（含膨胀系数）
+    config = _get_config()
+    total_timeout = calculate_chain_timeout(
+        stages, config,
+        synthesizer_role=aggregator_role if synthesize else None,
+    )
+
     results: list[dict] = []
     total_cost = 0.0
+    chain_start = time.monotonic()
 
     for i, stage in enumerate(stages):
+        # 动态超时检查：每一步开始前判断总耗时是否已超过阈值
+        elapsed = time.monotonic() - chain_start
+        if elapsed >= total_timeout:
+            return _render_chain_result(
+                task, results, total_cost,
+                project_dir_warning=project_dir_warning,
+                timeout_info=(
+                    f"链路在第 {i+1} 步前主动终止：累计耗时 {elapsed:.1f}s 超过动态阈值 {total_timeout:.0f}s"
+                    f"（{len(stages)}步链路，膨胀系数 {INFLATION_FACTOR}）。"
+                    f"已完成 {i}/{len(stages)} 步。"
+                ),
+            )
+
         tool_name = stage.get("tool", "")
         custom_prompt = stage.get("prompt", "") or ""
         # role单独取出，避免下方**tool_kwargs展开时与显式传入的role=形参冲突（TypeError: multiple values）
@@ -466,8 +548,19 @@ async def _execute_delegate_chain(
         if not step_result["ok"]:
             return _render_chain_result(task, results, total_cost, failed_at=i, project_dir_warning=project_dir_warning)
 
-    # synthesize 综合步骤
+    # synthesize 综合步骤（也受动态超时约束）
     if synthesize:
+        elapsed = time.monotonic() - chain_start
+        if elapsed >= total_timeout:
+            return _render_chain_result(
+                task, results, total_cost,
+                project_dir_warning=project_dir_warning,
+                timeout_info=(
+                    f"链路在 synthesize 步骤前主动终止：累计耗时 {elapsed:.1f}s 超过动态阈值 {total_timeout:.0f}s"
+                    f"（{len(stages)}步链路，膨胀系数 {INFLATION_FACTOR}）。"
+                    f"已完成 {len(stages)}/{len(stages)} 步，综合步骤未执行。"
+                ),
+            )
         synth_result = await _run_synthesize(task, results, project_dir, aggregator_role)
         results.append(synth_result)
         total_cost += synth_result.get("cost_usd", 0.0)
@@ -475,3 +568,210 @@ async def _execute_delegate_chain(
             return _render_chain_result(task, results, total_cost, failed_at=len(stages), project_dir_warning=project_dir_warning)
 
     return _render_chain_result(task, results, total_cost, project_dir_warning=project_dir_warning)
+
+
+# ─── delegate_dialogue session 管理与编排 ────────────────────────────
+# 跨MCP调用接力的对话上下文：子Agent提问后存session，主Agent带session_id续答。
+# 内存态，进程重启即失（对话是临时态）；TTL兜底清理；无外部资源故无需atexit。
+# 与 _NEED_ADVISOR_TAG 的哨兵模式同源，区别在此处是"中途向主Agent提问并继续同一任务"。
+
+_DIALOGUE_SESSIONS: dict[str, dict] = {}
+_DIALOGUE_LOCK = threading.Lock()
+_DIALOGUE_SESSION_TTL = 600  # 10分钟，对话周期上限
+
+def _cleanup_expired_sessions_locked() -> None:
+    """ 清理过期session（调用方须持 _DIALOGUE_LOCK） """
+    now = time.monotonic()
+    expired = [
+        sid for sid, s in _DIALOGUE_SESSIONS.items()
+        if now - s.get("created_at", now) > _DIALOGUE_SESSION_TTL
+    ]
+    for sid in expired:
+        _DIALOGUE_SESSIONS.pop(sid, None)
+
+def _new_session(
+    question: str, project_dir: str, cwd: str, role: str,
+    context_files: list[str] | None, allow_web: bool,
+    memory: str, config,
+) -> str:
+    """ 新建对话session，返回 session_id """
+    sid = uuid.uuid4().hex[:12]
+    with _DIALOGUE_LOCK:
+        _cleanup_expired_sessions_locked()
+        _DIALOGUE_SESSIONS[sid] = {
+            "question": question,
+            "project_dir": project_dir,
+            "cwd": cwd,
+            "role": role,
+            "context_files": context_files,
+            "allow_web": allow_web,
+            "memory": memory,
+            "config": config,
+            "prev_conclusion": "",
+            "turns": 0,
+            "created_at": time.monotonic(),
+            "history": [],  # [{"turn": int, "question": str, "answer": str}]
+        }
+    return sid
+
+def _get_session(session_id: str) -> dict | None:
+    """ 取session，不存在/过期返回None；惰性清理过期 """
+    with _DIALOGUE_LOCK:
+        _cleanup_expired_sessions_locked()
+        return _DIALOGUE_SESSIONS.get(session_id)
+
+def _update_session(session_id: str, **fields) -> None:
+    """ 锁内更新session字段 """
+    with _DIALOGUE_LOCK:
+        s = _DIALOGUE_SESSIONS.get(session_id)
+        if s is not None:
+            s.update(fields)
+
+def _append_history(session_id: str, entry: dict) -> None:
+    """ 锁内向session.history追加一条记录 """
+    with _DIALOGUE_LOCK:
+        s = _DIALOGUE_SESSIONS.get(session_id)
+        if s is not None:
+            s["history"].append(entry)
+
+def _set_history_answer(session_id: str, answer: str) -> None:
+    """ 锁内补全history最后一条的answer（续答时调用） """
+    with _DIALOGUE_LOCK:
+        s = _DIALOGUE_SESSIONS.get(session_id)
+        if s is not None and s["history"]:
+            s["history"][-1]["answer"] = answer
+
+def _close_session(session_id: str) -> dict | None:
+    """ 关闭session并返回其内容（供结束分支取history）；不存在返回None """
+    with _DIALOGUE_LOCK:
+        return _DIALOGUE_SESSIONS.pop(session_id, None)
+
+def _get_session_turns(session_id: str) -> int:
+    """ 取session已记录的轮次（新建后0，续答前是上轮值） """
+    with _DIALOGUE_LOCK:
+        s = _DIALOGUE_SESSIONS.get(session_id)
+        return s["turns"] if s else 0
+
+async def _execute_delegate_dialogue(
+    question: str,
+    project_dir: str,
+    role: str,
+    context_files: list[str] | None,
+    allow_web: bool,
+    session_id: str,
+    answer: str,
+    max_dialogue: int,
+) -> str:
+    """
+    delegate_dialogue 编排：新建/续答分流 + 子Agent一轮 + 提问检测/续答接力
+    - 新建：question+project_dir必填，建session，跑首轮，有提问则存上下文返回提问
+    - 续答：session_id+answer，取上下文，截断prev_conclusion，跑下一轮，提问或结束
+    - max_dialogue上限：达上限时强行取当前结论结束，防无限循环
+    """
+    if not isinstance(max_dialogue, int) or isinstance(max_dialogue, bool) or max_dialogue < 1:
+        return "[AgentParliament]delegate_dialogue 调用错误：max_dialogue 必须是大于等于 1 的整数。"
+
+    is_continue = bool(session_id)
+    project_dir_warning = "" if is_continue else _project_dir_warning(project_dir)
+
+    # —— 分流 ——
+    if is_continue:
+        session = _get_session(session_id)
+        if session is None:
+            return (
+                "[AgentParliament]delegate_dialogue 会话已过期或不存在"
+                "（session TTL=600s 或已关闭），请重新开始一次新的 delegate_dialogue 调用。"
+            )
+        if not answer:
+            return (
+                f"[AgentParliament]delegate_dialogue 续答需传 answer 参数"
+                f"（session_id={session_id}），请回答上一轮子Agent的提问后再次调用。"
+            )
+        # 续答前先补全上一轮提问的回答到history
+        _set_history_answer(session_id, answer)
+        # 达上限：不继续，返回上轮结论
+        if session["turns"] >= max_dialogue:
+            _close_session(session_id)
+            return _format_dialogue_final(
+                session["prev_conclusion"], None, 0.0,
+                session["history"], project_dir_warning,
+            ) + "\n\n（已达对话上限，取子Agent上一轮结论）"
+        # 截断prev_conclusion防续答轮prompt膨胀导致单轮超时
+        truncated_prev = _truncate_for_chain(session["prev_conclusion"])
+        truncated = truncated_prev != session["prev_conclusion"]
+        prompt = _build_dialogue_continue_prompt(truncated_prev, answer, session["question"])
+        memory = session["memory"]
+        cwd = session["cwd"]
+        config = session["config"]
+        role = session["role"]
+        allow_web = session["allow_web"]
+    else:
+        if not question:
+            return "[AgentParliament]delegate_dialogue 调用错误：首次调用 question 必填。"
+        if not project_dir:
+            return (
+                "[AgentParliament]delegate_dialogue 调用错误：project_dir 必填"
+                "（对话需读取项目CLAUDE.md记忆体，不传则副Agent无上下文）。"
+            )
+        try:
+            cwd = _resolve_cwd(project_dir)
+            config = _get_config()
+        except ProfileError as exc:
+            return f"[AgentParliament] 配置或调用错误：{exc}"
+        memory = _memory_block(cwd)
+        prompt = _build_dialogue_prompt(question, context_files)
+        session_id = _new_session(
+            question, project_dir, cwd, role, context_files, allow_web, memory, config,
+        )
+        truncated = False
+
+    # —— 跑一轮子Agent（default + 只读白名单，与delegate_research一致）——
+    allowed = list(_RESEARCH_TOOLS_WEB if allow_web else _RESEARCH_TOOLS_LOCAL)
+    try:
+        result = await asyncio.to_thread(
+            run_with_chain,
+            config=config, role=role, prompt=memory + prompt,
+            cwd=cwd, allowed_tools=allowed,
+            permission_mode="default", disallowed_tools=_DISALLOWED_TOOLS,
+        )
+    except ProfileError as exc:
+        if not is_continue:
+            _close_session(session_id)  # 新建失败清理空session
+        return f"[AgentParliament] 配置或调用错误：{exc}"
+    except Exception as exc:
+        # 兜底：非预期异常（CancelledError/KeyboardInterrupt/等）也清理session，避免泄漏至TTL
+        if not is_continue:
+            _close_session(session_id)
+        return f"[AgentParliament] 调用错误：{exc}"
+
+    # 失败：不更新prev_conclusion（续答保留上轮供重试），返回失败渲染
+    if not result.ok:
+        if not is_continue:
+            _close_session(session_id)
+        return project_dir_warning + _format_result(result)
+
+    # —— 检测提问标记 ——
+    has_ask, ask_question, conclusion = detect_ask_parent(result.text)
+    prev_turns = _get_session_turns(session_id)  # 新建后0，续答前是上轮值
+    new_turns = prev_turns + 1
+
+    if has_ask and new_turns < max_dialogue:
+        # 有提问且未达上限：存上下文供续答
+        _update_session(session_id, prev_conclusion=conclusion, turns=new_turns)
+        _append_history(session_id, {"turn": new_turns, "question": ask_question, "answer": ""})
+        return _format_ask_response(
+            session_id, ask_question, conclusion, new_turns, max_dialogue, result.model_used,
+            result.total_cost_usd,
+        )
+
+    # 无提问或达上限：先记录达上限轮的未回答提问，再取history关闭
+    reached_limit = has_ask and new_turns >= max_dialogue
+    if reached_limit:
+        _append_history(session_id, {"turn": new_turns, "question": ask_question, "answer": "(达上限未回答)"})
+    closed = _close_session(session_id)
+    history = closed["history"] if closed else []
+    suffix = "\n\n（已达对话上限 max_dialogue，子Agent仍想提问，取其当前结论）" if reached_limit else ""
+    return _format_dialogue_final(
+        conclusion, result.model_used, result.total_cost_usd,
+        history, project_dir_warning, truncated=truncated,
+    ) + suffix

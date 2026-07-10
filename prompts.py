@@ -6,6 +6,8 @@ prompts.py——AgentParliament的prompt构造与共享记忆体注入
    保证单工具调用与链内调用产出完全一致）
 2. 读取副Agent工作目录下的CLAUDE.md/SPEC.md/docs/adr，渲染成注入prompt开头的记忆块
    （显式注入而非依赖Claude Code自动加载，确保headless模式下副Agent确定性地获得项目上下文）
+3. delegate_dialogue专用prompt构造（首轮含对话能力指引、续答轮注入上轮结论+主Agent回答）
+4. [ASK_PARENT]提问标记检测（detect_ask_parent）
 
 本模块是纯叶子模块：不import任何项目内其他模块，不持有全局可变状态。
 """
@@ -443,3 +445,63 @@ def _build_advisor_draft_prompt(
         joined = "\n".join(f"- {p}" for p in context_files)
         draft_prompt += f"\n\n请优先阅读以下相关文件，无需扫描整个项目：\n{joined}"
     return draft_prompt
+
+
+# ─── delegate_dialogue 对话哨兵与续答 prompt ──────────────────────────
+# 子Agent在调研中途遇到需主Agent确认的方向时，在结论末尾输出 [ASK_PARENT] 问题 标记结束本轮；
+# 主进程检测标记、保存对话上下文（session），主Agent带 session_id+answer 再次调用续答。
+# 复用 _NEED_ADVISOR_TAG 的哨兵模式，区别：_NEED_ADVISOR 是“结束后升级求助强模型”，
+# _ASK_PARENT 是“中途向主Agent提问并继续同一任务”。
+
+_ASK_PARENT_TAG = "[ASK_PARENT]"
+# 匹配 [ASK_PARENT] 标记及之后的内容；question 取标记后第一行，多行内容归入结论
+_ASK_PARENT_PATTERN = re.compile(r"\[ASK_PARENT\]\s*(.+)", re.DOTALL)
+
+def detect_ask_parent(text: str) -> tuple[bool, str, str]:
+    """
+    从子Agent输出检测 [ASK_PARENT] 提问标记
+    返回 (has_ask, question, conclusion_without_tag)：
+    - has_ask=True：question 为标记后第一行（问题摘要），conclusion 为去标记后的原文
+    - has_ask=False：question="", conclusion=text 原样
+    best-effort：无标记返回原文，不阻断主流程
+    """
+    m = _ASK_PARENT_PATTERN.search(text)
+    if not m:
+        return False, "", text
+    question = m.group(1).split("\n")[0].strip()
+    conclusion = _ASK_PARENT_PATTERN.sub("", text).rstrip()
+    return True, question, conclusion
+
+def _build_dialogue_prompt(question: str, context_files: list[str] | None) -> str:
+    """
+    构造 delegate_dialogue 首轮 prompt：复用 _build_research_prompt，追加对话能力指引
+    指引子Agent在遇需主Agent确认方向时，输出 [ASK_PARENT] 问题 结束本轮
+    """
+    prompt = _build_research_prompt(question, context_files)
+    prompt += (
+        "\n\n[对话能力] 若在调研中遇到需要主Agent确认的方向"
+        "（如：多个可行路径不知选哪个、发现超出调研范围的关键风险、"
+        "需要主Agent提供额外业务约束等），"
+        f"请在结论末尾另起一行输出标记 `{_ASK_PARENT_TAG} 你的问题`，"
+        "然后结束本轮。主Agent回答后会让你继续同一任务。"
+        "若无此需求，正常输出结论即可，不要输出该标记。"
+    )
+    return prompt
+
+def _build_dialogue_continue_prompt(
+    prev_conclusion: str,
+    answer: str,
+    original_task: str,
+) -> str:
+    """
+    构造 delegate_dialogue 续答轮 prompt：注入上轮结论 + 主Agent回答 + 继续指令
+    prev_conclusion 已由调用方截断（_truncate_for_chain），此处不再截断
+    """
+    return (
+        f"原始任务：{original_task}\n\n"
+        f"你上一轮的结论如下（供你回忆上下文，不要重复输出已述内容）：\n{prev_conclusion}\n\n"
+        f"主Agent对你提问的回答：{answer}\n\n"
+        "请基于此回答继续完成原始任务，输出最终结论。"
+        f"若仍有需主Agent确认的方向，可再次输出 {_ASK_PARENT_TAG} 问题。"
+        f"{_NO_HALT_NOTICE}"
+    )

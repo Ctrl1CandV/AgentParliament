@@ -144,18 +144,25 @@ def _render_chain_result(
     total_cost: float,
     failed_at: int | None = None,
     project_dir_warning: str = "",
+    timeout_info: str = "",
 ) -> str:
     """ 渲染delegate_chain结果给主Agent """
     n = len(results)
-    all_ok = failed_at is None
 
-    if all_ok:
+    # 超时终止：步骤未执行即被跳过，不是"失败"，需要独立 header 措辞
+    if timeout_info:
+        header = f"[AgentParliament]delegate_chain 超时终止，已完成 {n} 个步骤。"
+    elif failed_at is None:
         header = f"[AgentParliament]delegate_chain 完成，共 {n} 个步骤，全部成功。"
     else:
         header = f"[AgentParliament]delegate_chain 在第 {failed_at + 1} 步失败，已完成 {failed_at} 个步骤。"
 
     if total_cost > 0:
         header += f" 总成本：${total_cost:.4f}"
+
+    # 超时详情追加在 header 后
+    if timeout_info:
+        header += f"\n{timeout_info}"
 
     # 最终结论：最后一步的输出
     final_text = results[-1].get("text", "") if results else ""
@@ -177,3 +184,54 @@ def _render_chain_result(
         sections.append(section)
 
     return project_dir_warning + header + "\n\n" + "\n\n".join(sections)
+
+
+# ─── delegate_dialogue 渲染 ──────────────────────────────────────────
+
+def _format_ask_response(
+    session_id: str,
+    question: str,
+    prev_conclusion: str,
+    turn: int,
+    max_dialogue: int,
+    model_used: str | None,
+    cost_usd: float = 0.0,
+) -> str:
+    """ 渲染 delegate_dialogue 的提问返回：含子Agent当前结论 + 提问 + 续答指引 """
+    model_tag = f"（模型 `{model_used}`）" if model_used else ""
+    cost_tag = f" 本轮成本：${cost_usd:.4f}" if cost_usd > 0 else ""
+    return (
+        f"[AgentParliament] 子Agent请求确认（对话轮次 {turn}/{max_dialogue}）{model_tag}{cost_tag}：\n"
+        f"待确认问题：{question}\n"
+        f"———— 子Agent当前结论 ————\n{prev_conclusion}\n"
+        f"请再次调用 delegate_dialogue，传 session_id={session_id} 与 answer=<你的回答> "
+        f"让子Agent继续。若需结束对话，不再调用即可（session 将在 TTL 后自动清理）。"
+    )
+
+def _format_dialogue_final(
+    final_text: str,
+    model_used: str | None,
+    cost_usd: float,
+    history: list[dict],
+    project_dir_warning: str = "",
+    truncated: bool = False,
+) -> str:
+    """
+    渲染 delegate_dialogue 的最终返回：最终结论 + 对话历史
+    history: [{"turn": int, "question": str, "answer": str}, ...]
+    """
+    header = "[AgentParliament]对话完成"
+    if model_used:
+        header += f"，由模型`{model_used}`给出最终结论"
+    if cost_usd > 0:
+        header += f" 本次成本：${cost_usd:.4f}"
+
+    parts = [header + "\n\n" + final_text]
+    if truncated:
+        parts.append("（注：上轮结论过长已截断，子Agent基于截断版本继续）")
+    if history:
+        hist_lines = ["———— 对话历史 ————"]
+        for h in history:
+            hist_lines.append(f"【轮{h['turn']}】提问：{h['question']} → 回答：{h['answer']}")
+        parts.append("\n".join(hist_lines))
+    return project_dir_warning + "\n\n".join(parts)
