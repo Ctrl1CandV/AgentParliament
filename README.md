@@ -8,6 +8,8 @@
 [![MCP Protocol](https://img.shields.io/badge/MCP-1.2+-6366F1)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+**中文** | [English](README.en.md)
+
 </div>
 
 ---
