@@ -5,8 +5,8 @@ runner.py——AgentParliament的核心执行层
 2. 以独立环境变量启动claude -p子进程，让同一个Claude Code CLI
    通过ANTHROPIC_BASE_URL、ANTHROPIC_AUTH_TOKEN和ANTHROPIC_MODEL
    扮演不同的模型，如DeepSeek和GLM等
-3. 子进程统一以只读plan模式运行，不具备更改文件的能力，输出JSON后解析最终结果
-4. 失败时按角色链自动降级到下一个模型
+3. 子进程按工具所属能力阶梯运行（Tier 0 纯文本 API 直连 / Tier 1 只读探索 / Tier 2 worktree 隔离可写可执行），输出JSON后解析最终结果
+4. 失败时按角色链自动降级到下一个模型；CLIRunner 走 claude -p 子进程，APIRunner 走 httpx 直连 Anthropic 兼容端点
 """
 
 from __future__ import annotations
@@ -24,6 +24,12 @@ import json
 import time
 import sys
 import os
+
+# httpx 随 mcp 依赖安装；用于 APIRunner 直连 Anthropic 兼容端点，避免 CLI 子进程开销
+try:
+    import httpx
+except ImportError:  # pragma: no cover - mcp 依赖自带，正常不会触发
+    httpx = None
 
 PROFILES_PATH = Path(__file__).with_name("profiles.json")
 _DEBUG = os.environ.get("AGENTPARLIAMENT_DEBUG") == "1"
@@ -136,6 +142,8 @@ class AttemptResult:
     error: str = ""
     cost_usd: float | None = None
     error_type: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 @dataclass
 class RunResult:
@@ -155,11 +163,23 @@ class RunResult:
         """ 本轮所有尝试的累计成本 """
         return sum(a.cost_usd or 0.0 for a in self.attempts)
 
+    @property
+    def total_input_tokens(self) -> int:
+        """ 本轮所有尝试的累计输入 token（端点无关，比美元成本更通用） """
+        return sum(a.input_tokens or 0 for a in self.attempts)
+
+    @property
+    def total_output_tokens(self) -> int:
+        """ 本轮所有尝试的累计输出 token """
+        return sum(a.output_tokens or 0 for a in self.attempts)
+
 @dataclass
 class ParallelResult:
     """ 并行执行多个模型后的汇总结果 """
     results: list[AttemptResult]
     total_cost_usd: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
     @property
     def successful(self) -> list[AttemptResult]:
@@ -268,29 +288,37 @@ def _resolve_claude_executable() -> str:
     # 非Windows或已命中.exe，直接返回
     return raw
 
+def _safe_int(value) -> int | None:
+    """ 把 usage 里的 token 字段安全转成 int，非数字/缺失返回 None """
+    try:
+        n = int(value)
+        return n if n >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
 def _parse_cli_json(
     stdout: str | None,
     expected_prompt_chars: int = 0,
-) -> tuple[bool, str, str, float | None]:
+) -> tuple[bool, str, str, float | None, int | None, int | None]:
     """
     解析claude -p --output-format json的输出
-    返回(ok, text, error, cost_usd)
+    返回(ok, text, error, cost_usd, input_tokens, output_tokens)
     成功时取result字段为最终文本；is_error为真或字段缺失时视为失败
-    同时提取total_cost_usd字段用于成本追踪
+    同时提取total_cost_usd字段用于成本追踪，以及usage中的input/output_tokens用于token计数
     expected_prompt_chars为本次传入prompt的字符数，用于护栏检测prompt是否被截断
     """
     # 子进程异常退出或解码失败时subprocess可能把stdout置为None，先兜底
     if not stdout:
-        return False, "", "子进程没有任何输出", None
+        return False, "", "子进程没有任何输出", None, None, None
 
     stdout = stdout.strip()
     if not stdout:
-        return False, "", "子进程没有任何输出。", None
+        return False, "", "子进程没有任何输出。", None, None, None
 
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        return False, "", f"无法解析CLI输出为JSON：{exc}", None
+        return False, "", f"无法解析CLI输出为JSON：{exc}", None, None, None
 
     cost_usd = None
     if "total_cost_usd" in payload:
@@ -299,27 +327,30 @@ def _parse_cli_json(
         except (TypeError, ValueError):
             pass
 
+    # 提取 token 计数（usage 字段，端点无关的通用度量，比美元成本更有意义）
+    usage = payload.get("usage") or {}
+    input_tokens = _safe_int(usage.get("input_tokens"))
+    output_tokens = _safe_int(usage.get("output_tokens"))
+
     if payload.get("is_error"):
-        return False, "", payload.get("result", "CLI返回is_error=true"), cost_usd
+        return False, "", payload.get("result", "CLI返回is_error=true"), cost_usd, input_tokens, output_tokens
 
     result_text = payload.get("result")
     if not result_text:
-        return False, "", "CLI输出中缺少result字段或为空。", cost_usd
+        return False, "", "CLI输出中缺少result字段或为空。", cost_usd, input_tokens, output_tokens
 
     # 护栏：prompt预期较长但实际input_tokens极少，说明prompt可能在传参链路被截断
     # 中文约2字符/token，英文约4字符/token，取保守值3做估算；只在明显异常时告警，不阻断结果
     if expected_prompt_chars > 200:
-        usage = payload.get("usage") or {}
-        input_tokens = usage.get("input_tokens", 0)
         estimated_tokens = expected_prompt_chars / 3
-        if 0 < input_tokens < estimated_tokens * 0.3:
+        if input_tokens is not None and 0 < input_tokens < estimated_tokens * 0.3:
             warning = (
                 f"⚠️ 疑似prompt未完整送达：预期约{expected_prompt_chars}字符"
                 f"（≈{estimated_tokens:.0f} tokens），实际input_tokens={input_tokens}，请检查传参链路。"
             )
-            return True, f"{warning}\n\n{result_text}", "", cost_usd
+            return True, f"{warning}\n\n{result_text}", "", cost_usd, input_tokens, output_tokens
 
-    return True, result_text, "", cost_usd
+    return True, result_text, "", cost_usd, input_tokens, output_tokens
 
 def _classify_error(returncode: int, stderr: str) -> str:
     """ 根据退出码和stderr关键词对失败原因做基本分类，方便降级日志快速定位 """
@@ -399,6 +430,7 @@ def _run_once(
     permission_mode: str = "plan",
     disallowed_tools: list[str] | None = None,
     batch: BatchRegistry | None = None,
+    dangerously_skip_permissions: bool = False,
 ) -> AttemptResult:
     """
     用指定模型profile启动一次只读子进程并返回结果
@@ -412,6 +444,14 @@ def _run_once(
     - default模式下必须显式给出全部允许的工具，以约束只读边界，否则会按default模式的默认权限运行
     disallowed_tools：
     - 可选工具黑名单，--disallowedTools，优先级高于allowed_tools。用于 default 模式下防御 CLI 版本差异导致默认权限破防
+    dangerously_skip_permissions：
+    - 仅供 Tier 2（verify_implementation）使用：加 --dangerously-skip-permissions，让 headless 子 Agent
+      无需交互审批即可执行 Bash（跑 pytest 等）。这在 Windows 原生环境是"真正跑测试"的必要条件——
+      default 模式下 Bash 仍会触发审批提示而 headless 无法应答。
+    - 安全依据：Tier 2 子 Agent 运行在 worktree 一次性隔离副本内，主仓库工作树/索引全程不被触碰
+      （见 worktree_manager._create_snapshot_commit），改动仅以建议性 diff 交主 Agent 审批。
+      因此"跳过审批"的风险已被文件树隔离兜住；_VERIFY_DISALLOWED_TOOLS 黑名单（rm/push/curl 等）仍作纵深防御。
+    - 绝不用于 Tier 0/1 只读工具——那些工具没有隔离副本兜底，必须保留权限护栏。
     """
     claude_exe = _resolve_claude_executable()
 
@@ -426,6 +466,8 @@ def _run_once(
         cmd += ["--allowedTools", ",".join(allowed_tools)]
     if disallowed_tools:
         cmd += ["--disallowedTools", ",".join(disallowed_tools)]
+    if dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
     cmd.append("-p")
 
     env = profile.build_env(os.environ)
@@ -511,10 +553,11 @@ def _run_once(
         )
 
     # 解析json格式，传入prompt字符数用于截断护栏检测
-    ok, text, error, cost_usd = _parse_cli_json(completed.stdout, len(prompt))
+    ok, text, error, cost_usd, input_tokens, output_tokens = _parse_cli_json(completed.stdout, len(prompt))
     return AttemptResult(
         model_name=profile.name, ok=ok, text=text, error=error,
         cost_usd=cost_usd,
+        input_tokens=input_tokens, output_tokens=output_tokens,
     )
 
 def run_with_chain(
@@ -524,67 +567,28 @@ def run_with_chain(
     allowed_tools: list[str] | None = None,
     permission_mode: str = "plan",
     disallowed_tools: list[str] | None = None,
+    dangerously_skip_permissions: bool = False,
 ) -> RunResult:
     """
-    按角色失败链依次尝试，第一个成功即返回；全部失败则返回失败结果。
-    因为只读任务幂等，降级重跑是安全的。
+    按角色失败链依次尝试（CLI 后端），第一个成功即返回；全部失败则返回失败结果。
+    委托给模块级 CLIRunner 单例，保持向后兼容签名不变。
+    只读任务幂等，降级重跑是安全的。
 
     熔断器集成：
     - 链上被熔断的模型自动跳过（冷却期内不尝试），记录为"熔断跳过"
     - 只有明确的"模型不可用"类错误（鉴权/限流/网络/模型ID）才计入熔断失败计数
     - 超时和未知错误不计入——超时可能是模型在认真思考，不代表"模型挂了"
     - 成功一次即清零该模型的失败计数
+
+    dangerously_skip_permissions：仅 Tier 2（verify_implementation）传 True，
+    让 headless 子 Agent 无需审批即可跑测试；安全性由 worktree 隔离兜底（见 _run_once）。
     """
-    if role not in config.roles:
-        raise ProfileError(f"未定义的角色'{role}'")
-
-    attempts: list[AttemptResult] = []
-    for model_name in config.roles[role]:
-        # 熔断器：跳过冷却期内的模型
-        if _circuit_is_open(model_name):
-            attempts.append(AttemptResult(
-                model_name=model_name, ok=False,
-                error=f"模型被熔断跳过（连续失败≥{_CIRCUIT_FAILURE_THRESHOLD}次，冷却中）",
-                error_type="熔断跳过",
-            ))
-            continue
-
-        profile = config.models[model_name]
-        try:
-            attempt = _run_once(
-                profile=profile,
-                prompt=prompt,
-                cwd=cwd,
-                timeout_seconds=config.timeout_for(role),
-                extra_dirs=extra_dirs,
-                allowed_tools=allowed_tools,
-                permission_mode=permission_mode,
-                disallowed_tools=disallowed_tools,
-            )
-        except Exception as exc:
-            # _run_once的非超时异常（BrokenPipeError等）不中断降级链，转成失败结果继续尝试下一个模型
-            attempt = AttemptResult(
-                model_name=model_name, ok=False,
-                error=f"执行时发生未预期异常：{exc}",
-            )
-        attempts.append(attempt)
-
-        if attempt.ok:
-            # 成功：清零该模型的熔断失败计数
-            _circuit_record_success(model_name)
-            return RunResult(
-                ok=True,
-                text=attempt.text,
-                model_used=model_name,
-                attempts=attempts,
-            )
-
-        # 失败：只有"模型不可用"类错误才计入熔断
-        if _circuit_should_trip(attempt.error_type):
-            _circuit_record_failure(model_name)
-
-    # 链上所有模型都失败了
-    return RunResult(ok=False, text="", model_used=None, attempts=attempts)
+    return _CLI_RUNNER.run_with_chain(
+        config=config, role=role, prompt=prompt, cwd=cwd,
+        extra_dirs=extra_dirs, allowed_tools=allowed_tools,
+        permission_mode=permission_mode, disallowed_tools=disallowed_tools,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+    )
 
 def run_parallel(
     config: Config, role: str,
@@ -675,7 +679,12 @@ def run_parallel(
                 )
 
     total_cost = sum(r.cost_usd or 0.0 for r in results)
-    return ParallelResult(results=results, total_cost_usd=total_cost)
+    total_in = sum(r.input_tokens or 0 for r in results)
+    total_out = sum(r.output_tokens or 0 for r in results)
+    return ParallelResult(
+        results=results, total_cost_usd=total_cost,
+        total_input_tokens=total_in, total_output_tokens=total_out,
+    )
 
 
 # ─── 轻量熔断器 ───────────────────────────────────────────
@@ -733,6 +742,324 @@ def _circuit_record_success(model_name: str) -> None:
     """记录一次成功，清零失败计数"""
     with _CIRCUIT_LOCK:
         _CIRCUIT_STATE.pop(model_name, None)
+
+
+# ─── Runner 抽象层（问题4：CLI/API 双后端） ──────────────────────────
+# BaseRunner 封装"角色失败链 + 熔断器"的通用循环逻辑，与具体执行方式（CLI/API）无关。
+# 子类只需实现 _execute_once（单次模型调用）即可复用整条降级链、熔断器、错误处理。
+# 模块级 run_with_chain / run_with_chain_api 分别委托给 CLIRunner / APIRunner 单例。
+
+class BaseRunner:
+    """
+    执行后端的抽象基类：封装角色失败链 + 熔断器循环，与具体执行方式无关。
+
+    子类实现 _execute_once，接收 profile/prompt/cwd/timeout 及执行专属参数，
+    返回 AttemptResult。本类的 run_with_chain 负责按角色链遍历、熔断跳过、
+    成功即返回、失败按 error_type 计入熔断——这部分逻辑对 CLI 和 API 完全一致。
+    """
+
+    def run_with_chain(
+        self,
+        config: Config, role: str,
+        prompt: str, cwd: str,
+        extra_dirs: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
+        permission_mode: str = "plan",
+        disallowed_tools: list[str] | None = None,
+        dangerously_skip_permissions: bool = False,
+    ) -> RunResult:
+        """
+        按角色失败链依次尝试，第一个成功即返回；全部失败则返回失败结果。
+        只读任务幂等，降级重跑是安全的。
+
+        熔断器集成：
+        - 链上被熔断的模型自动跳过（冷却期内不尝试），记录为"熔断跳过"
+        - 只有明确的"模型不可用"类错误（鉴权/限流/网络/模型ID）才计入熔断失败计数
+        - 超时和未知错误不计入——超时可能是模型在认真思考，不代表"模型挂了"
+        - 成功一次即清零该模型的失败计数
+
+        dangerously_skip_permissions：透传给 _execute_once（仅 CLIRunner 使用），
+        仅 Tier 2 隔离场景传 True；APIRunner 忽略该参数。
+        """
+        if role not in config.roles:
+            raise ProfileError(f"未定义的角色'{role}'")
+
+        attempts: list[AttemptResult] = []
+        for model_name in config.roles[role]:
+            # 熔断器：跳过冷却期内的模型
+            if _circuit_is_open(model_name):
+                attempts.append(AttemptResult(
+                    model_name=model_name, ok=False,
+                    error=f"模型被熔断跳过（连续失败≥{_CIRCUIT_FAILURE_THRESHOLD}次，冷却中）",
+                    error_type="熔断跳过",
+                ))
+                continue
+
+            profile = config.models[model_name]
+            try:
+                attempt = self._execute_once(
+                    profile=profile,
+                    prompt=prompt,
+                    cwd=cwd,
+                    timeout_seconds=config.timeout_for(role),
+                    extra_dirs=extra_dirs,
+                    allowed_tools=allowed_tools,
+                    permission_mode=permission_mode,
+                    disallowed_tools=disallowed_tools,
+                    dangerously_skip_permissions=dangerously_skip_permissions,
+                )
+            except Exception as exc:
+                # _execute_once 的非超时异常不中断降级链，转成失败结果继续尝试下一个模型
+                attempt = AttemptResult(
+                    model_name=model_name, ok=False,
+                    error=f"执行时发生未预期异常：{exc}",
+                )
+            attempts.append(attempt)
+
+            if attempt.ok:
+                # 成功：清零该模型的熔断失败计数
+                _circuit_record_success(model_name)
+                return RunResult(
+                    ok=True,
+                    text=attempt.text,
+                    model_used=model_name,
+                    attempts=attempts,
+                )
+
+            # 失败：只有"模型不可用"类错误才计入熔断
+            if _circuit_should_trip(attempt.error_type):
+                _circuit_record_failure(model_name)
+
+        # 链上所有模型都失败了
+        return RunResult(ok=False, text="", model_used=None, attempts=attempts)
+
+    def _execute_once(
+        self,
+        profile: ModelProfile,
+        prompt: str, cwd: str,
+        timeout_seconds: int,
+        extra_dirs: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
+        permission_mode: str = "plan",
+        disallowed_tools: list[str] | None = None,
+        dangerously_skip_permissions: bool = False,
+    ) -> AttemptResult:
+        """子类实现：用指定 profile 执行一次模型调用，返回 AttemptResult。"""
+        raise NotImplementedError
+
+
+class CLIRunner(BaseRunner):
+    """
+    Claude Code CLI 后端：通过 claude -p 子进程执行，自带文件系统工具与只读沙箱。
+    对应 Tier 1/Tier 2 场景（需要 Read/Grep/Glob 或 worktree 内可写可执行）。
+    """
+
+    def _execute_once(
+        self,
+        profile: ModelProfile,
+        prompt: str, cwd: str,
+        timeout_seconds: int,
+        extra_dirs: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
+        permission_mode: str = "plan",
+        disallowed_tools: list[str] | None = None,
+        dangerously_skip_permissions: bool = False,
+    ) -> AttemptResult:
+        return _run_once(
+            profile=profile,
+            prompt=prompt,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            extra_dirs=extra_dirs,
+            allowed_tools=allowed_tools,
+            permission_mode=permission_mode,
+            disallowed_tools=disallowed_tools,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+        )
+
+
+class APIRunner(BaseRunner):
+    """
+    Anthropic 兼容 API 直连后端：用 httpx 对 profiles.json 的 base_url 发 /v1/messages 请求。
+    对应 Tier 0 场景（纯文本融合，不需要文件系统访问）。
+    相比 CLIRunner 省去子进程启动、JSON 输出解析、ccswitch 环境变量消毒等开销，更快更省。
+
+    与 CLIRunner 的差异：
+    - 不支持 permission_mode / allowed_tools / disallowed_tools（这些是 Claude Code CLI 专属概念）
+      —— API 直连没有"工具调用"环节，模型只做文本生成。这三个参数传入后被忽略。
+    - 不需要 cwd / extra_dirs（不访问文件系统）
+    - max_tokens 设较大值，避免 thinking block 耗尽预算导致 text block 为空（deepseek 等模型实测）
+    - 成本取自响应 usage；端点未返回 usage 时为 None
+    """
+
+    # 思考型模型（如 deepseek-v4）的 thinking block 会消耗 token，需留足预算给 text block
+    _MAX_TOKENS = 16000
+
+    def _execute_once(
+        self,
+        profile: ModelProfile,
+        prompt: str, cwd: str,
+        timeout_seconds: int,
+        extra_dirs: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
+        permission_mode: str = "plan",
+        disallowed_tools: list[str] | None = None,
+        dangerously_skip_permissions: bool = False,
+    ) -> AttemptResult:
+        # cwd/extra_dirs/permission_mode/allowed_tools/disallowed_tools/dangerously_skip_permissions
+        # 都是 CLI 专属参数，API 直连不涉及文件系统与工具调用，此处忽略，仅用 profile + prompt
+        del cwd, extra_dirs, permission_mode, allowed_tools, disallowed_tools
+        del dangerously_skip_permissions
+
+        if httpx is None:
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error="httpx 未安装，APIRunner 不可用（请检查 mcp 依赖）",
+                error_type="未知错误",
+            )
+
+        url = profile.base_url.rstrip("/") + "/v1/messages"
+        # 同时发 x-api-key 与 Authorization: Bearer：CLI 路径靠 ANTHROPIC_AUTH_TOKEN
+        # 走 Bearer 认证，很多第三方 Anthropic 兼容网关（GLM 等）只认 Bearer 而不认
+        # x-api-key。只发 x-api-key 会导致这些端点在 API 直连路径上 401，表现为
+        # consensus 合成/advisor 升级等 Tier 0 场景「总是静默降级」。两个都发，
+        # 与 CLI 路径的鉴权语义对齐，端点认哪个用哪个。
+        headers = {
+            "x-api-key": profile.token,
+            "authorization": f"Bearer {profile.token}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": profile.model,
+            "max_tokens": self._MAX_TOKENS,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=timeout_seconds)
+        except httpx.TimeoutException:
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API请求超时>{timeout_seconds}s",
+                error_type="超时",
+            )
+        except httpx.ConnectError as exc:
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API连接失败：{exc}",
+                error_type="网络连接",
+            )
+        except Exception as exc:
+            # 其他网络层异常（ReadTimeout/RemoteProtocolError等）不中断降级链
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API请求异常：{type(exc).__name__}: {exc}",
+                error_type="未知错误",
+            )
+
+        # 解析响应
+        error_type = _classify_api_error(resp.status_code, resp)
+        if resp.status_code != 200:
+            body_snippet = resp.text[:500] if resp.text else ""
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API返回 HTTP {resp.status_code}：{body_snippet}",
+                error_type=error_type,
+            )
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API响应非合法JSON：{exc}",
+                error_type="未知错误",
+            )
+
+        # 从 content blocks 提取 text（跳过 thinking block）
+        text_parts = [
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        ]
+        text = "".join(text_parts).strip()
+
+        if not text:
+            # 有响应但无 text block：可能是 max_tokens 全被 thinking 消耗，或模型返回空
+            stop_reason = data.get("stop_reason", "")
+            usage = data.get("usage", {})
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=(
+                    f"API响应无 text block（stop_reason={stop_reason}, "
+                    f"usage={usage}）；可能 max_tokens 不足或模型返回空"
+                ),
+                error_type="未知错误",
+            )
+
+        # 成本：Anthropic 标准响应的 usage 字段，未提供时为 None
+        cost_usd = None  # API 响应不含美元成本，保持 None 与 CLI 路径一致
+        # token 计数：从 usage 提取，端点无关的通用度量
+        api_usage = data.get("usage") or {}
+        input_tokens = _safe_int(api_usage.get("input_tokens"))
+        output_tokens = _safe_int(api_usage.get("output_tokens"))
+
+        if _DEBUG:
+            _debug_log(
+                f"--- APIRunner model={profile.name} ---\n"
+                f"HTTP {resp.status_code}, text[:200]={text[:200]!r}\n"
+                f"tokens: in={input_tokens} out={output_tokens}\n"
+            )
+
+        return AttemptResult(
+            model_name=profile.name, ok=True,
+            text=text, cost_usd=cost_usd,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+        )
+
+
+def _classify_api_error(status_code: int, resp) -> str:
+    """
+    把 HTTP 状态码分类为与 _classify_error 一致的 error_type 字符串，
+    使 APIRunner 的错误能无缝接入现有熔断器（认鉴权失败/额度限流/模型ID无效/网络连接）。
+    """
+    if status_code in (401, 403):
+        return "鉴权失败"
+    if status_code == 429:
+        return "额度/限流"
+    if status_code == 404:
+        return "模型ID无效"
+    if status_code in (502, 503, 504):
+        return "网络连接"
+    return "未知错误"
+
+
+# 模块级单例：模块级 run_with_chain / run_with_chain_api 委托给它们
+_CLI_RUNNER = CLIRunner()
+_API_RUNNER = APIRunner()
+
+
+def run_with_chain_api(
+    config: Config, role: str,
+    prompt: str, cwd: str,
+    extra_dirs: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    permission_mode: str = "plan",
+    disallowed_tools: list[str] | None = None,
+) -> RunResult:
+    """
+    按角色失败链依次尝试（API 直连后端），签名与 run_with_chain 完全一致。
+    用于 Tier 0 场景（纯文本融合，不需文件系统访问）。
+    cwd/extra_dirs/permission_mode 等参数传入但被忽略——API 直连不涉及文件系统与工具调用。
+    复用 BaseRunner 的失败链 + 熔断器逻辑，与 CLIRunner 共享同一套熔断状态。
+    """
+    return _API_RUNNER.run_with_chain(
+        config=config, role=role, prompt=prompt, cwd=cwd,
+        extra_dirs=extra_dirs, allowed_tools=allowed_tools,
+        permission_mode=permission_mode, disallowed_tools=disallowed_tools,
+    )
+
 
 
 def health_check(config: Config) -> list[str]:

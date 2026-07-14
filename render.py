@@ -21,6 +21,20 @@ _REQUIRED_REVIEW_KEYS = {"severity", "file", "line", "description", "suggestion"
 # helper：截断超长__PREVIOUS_RESULT_
 _CHAIN_RESULT_TRUNCATE_THRESHOLD = 10000
 
+def _fmt_tokens(input_tokens: int | None, output_tokens: int | None) -> str:
+    """
+    把 token 计数格式化为可读字符串，用于结果展示。
+    None 时返回空串（调用方据此决定是否展示用量行）。
+    大数用 k 缩写（1234 → 1.2k），避免长数字挤占行宽。
+    """
+    if input_tokens is None and output_tokens is None:
+        return ""
+    def _short(n: int | None) -> str:
+        if n is None:
+            return "?"
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+    return f"{_short(input_tokens)} input + {_short(output_tokens)} output tokens"
+
 def _format_result(result: RunResult) -> str:
     """ 把RunResult渲染成给主Agent阅读的文本，并诚实标注降级情况与成本 """
     if not result.ok:
@@ -41,8 +55,9 @@ def _format_result(result: RunResult) -> str:
             f"\n注意：首选模型{failed}不可用，已降级到兜底模型。"
             f"若你需要的是独立第三方视角，请知悉本结果的模型多样性已打折扣。"
         )
-    if result.total_cost_usd > 0:
-        header += f"\n本次调用成本：${result.total_cost_usd:.4f}"
+    usage = _fmt_tokens(result.total_input_tokens, result.total_output_tokens)
+    if usage:
+        header += f"\n本次调用：{usage}"
     return f"{header}\n\n{result.text}"
 
 def _format_parallel_result(parallel: ParallelResult) -> str:
@@ -54,8 +69,9 @@ def _format_parallel_result(parallel: ParallelResult) -> str:
         return "\n".join(lines)
 
     header = f"[AgentParliament]{len(parallel.successful)}/{len(parallel.results)}个模型成功完成。"
-    if parallel.total_cost_usd > 0:
-        header += f" 总成本：${parallel.total_cost_usd:.4f}"
+    usage = _fmt_tokens(parallel.total_input_tokens, parallel.total_output_tokens)
+    if usage:
+        header += f" 总用量：{usage}"
     return f"{header}\n\n{parallel}"
 
 def _validate_structured_review(text: str) -> tuple[bool, str, str]:
@@ -128,14 +144,16 @@ def _chain_result_from_run(result: RunResult, text_override: str | None = None) 
         "text": (text_override if text_override is not None else result.text) if result.ok else "",
         "model_used": result.model_used,
         "cost_usd": result.total_cost_usd,
+        "input_tokens": result.total_input_tokens,
+        "output_tokens": result.total_output_tokens,
         "error": "" if result.ok else "所有模型调用失败",
     }
 
-def _chain_error(error: str, cost_usd: float = 0.0) -> dict:
+def _chain_error(error: str, cost_usd: float = 0.0, input_tokens: int = 0, output_tokens: int = 0) -> dict:
     """构造失败返回 dict"""
     return {
         "ok": False, "text": "", "model_used": None,
-        "cost_usd": cost_usd, "error": error,
+        "cost_usd": cost_usd, "input_tokens": input_tokens, "output_tokens": output_tokens, "error": error,
     }
 
 def _render_chain_result(
@@ -145,6 +163,8 @@ def _render_chain_result(
     failed_at: int | None = None,
     project_dir_warning: str = "",
     timeout_info: str = "",
+    total_input_tokens: int = 0,
+    total_output_tokens: int = 0,
 ) -> str:
     """ 渲染delegate_chain结果给主Agent """
     n = len(results)
@@ -157,8 +177,9 @@ def _render_chain_result(
     else:
         header = f"[AgentParliament]delegate_chain 在第 {failed_at + 1} 步失败，已完成 {failed_at} 个步骤。"
 
-    if total_cost > 0:
-        header += f" 总成本：${total_cost:.4f}"
+    usage = _fmt_tokens(total_input_tokens or 0, total_output_tokens or 0)
+    if usage:
+        header += f" 总用量：{usage}"
 
     # 超时详情追加在 header 后
     if timeout_info:
@@ -172,13 +193,16 @@ def _render_chain_result(
     for i, r in enumerate(results):
         status_ok = r.get("ok", False)
         model = r.get("model_used", "?")
-        cost = r.get("cost_usd", 0.0)
         text = r.get("text", "")
         error = r.get("error", "")
+        in_tok = r.get("input_tokens") or 0
+        out_tok = r.get("output_tokens") or 0
+        step_usage = _fmt_tokens(in_tok, out_tok)
         # 限制每步摘要长度，避免结果过长
         summary = text[:500] + "..." if len(text) > 500 else text
         tag = "✅" if status_ok else "❌"
-        section = f"【步骤{i+1}：{model} | ${cost:.4f} {tag}】\n{summary}"
+        usage_part = f" | {step_usage}" if step_usage else ""
+        section = f"【步骤{i+1}：{model}{usage_part} {tag}】\n{summary}"
         if error:
             section += f"\n错误：{error}"
         sections.append(section)
@@ -195,13 +219,15 @@ def _format_ask_response(
     turn: int,
     max_dialogue: int,
     model_used: str | None,
-    cost_usd: float = 0.0,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
 ) -> str:
     """ 渲染 delegate_dialogue 的提问返回：含子Agent当前结论 + 提问 + 续答指引 """
     model_tag = f"（模型 `{model_used}`）" if model_used else ""
-    cost_tag = f" 本轮成本：${cost_usd:.4f}" if cost_usd > 0 else ""
+    usage = _fmt_tokens(input_tokens, output_tokens)
+    usage_tag = f" 本轮：{usage}" if usage else ""
     return (
-        f"[AgentParliament] 子Agent请求确认（对话轮次 {turn}/{max_dialogue}）{model_tag}{cost_tag}：\n"
+        f"[AgentParliament] 子Agent请求确认（对话轮次 {turn}/{max_dialogue}）{model_tag}{usage_tag}：\n"
         f"待确认问题：{question}\n"
         f"———— 子Agent当前结论 ————\n{prev_conclusion}\n"
         f"请再次调用 delegate_dialogue，传 session_id={session_id} 与 answer=<你的回答> "
@@ -211,7 +237,8 @@ def _format_ask_response(
 def _format_dialogue_final(
     final_text: str,
     model_used: str | None,
-    cost_usd: float,
+    input_tokens: int | None,
+    output_tokens: int | None,
     history: list[dict],
     project_dir_warning: str = "",
     truncated: bool = False,
@@ -223,8 +250,9 @@ def _format_dialogue_final(
     header = "[AgentParliament]对话完成"
     if model_used:
         header += f"，由模型`{model_used}`给出最终结论"
-    if cost_usd > 0:
-        header += f" 本次成本：${cost_usd:.4f}"
+    usage = _fmt_tokens(input_tokens, output_tokens)
+    if usage:
+        header += f" 本次：{usage}"
 
     parts = [header + "\n\n" + final_text]
     if truncated:

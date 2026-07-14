@@ -30,7 +30,7 @@
 
 ## 它能做什么？
 
-### 9 个专业工具，覆盖开发全流程
+### 10 个专业工具，覆盖开发全流程
 
 | 工具                           | 作用                                                                                          | 典型场景                                                                           |
 | ------------------------------ | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
@@ -41,10 +41,11 @@
 | **validate_approach**    | 让模型扮演反对者，对架构/方案找漏洞                                                           | 方案实施前提前排雷                                                                 |
 | **test_audit**           | 静态分析源码与测试，找出未覆盖的逻辑分支与边界                                                | 实现完功能后想知道「哪些情况还没测到」                                             |
 | **advisor_analysis**     | 两阶段战略求助：中等模型先出草稿，不确定或高风险时才升级求助强模型                            | 想用便宜模型兜底、关键处再求助强模型（如 Claude Opus）                             |
-| **delegate_chain**       | 多步推理链：主 Agent 定义思维链结构，server.py 依次执行；链内子 Agent 可全文件读取            | 重要决策需要完整链路深入思考（如调研→审视→验证），担心自己有盲区                 |
+| **delegate_chain**       | 多步推理链：主 Agent 定义思维链结构，server.py 依次执行；链内子 Agent 可全文件读取            | 重要决策需要完整链路深入思考（如调研->审视->验证），担心自己有盲区                 |
 | **delegate_dialogue**    | 带对话能力的调研：子 Agent 可通过 `[ASK_PARENT]` 标记向主 Agent 提问，主 Agent 回答后继续    | 调研中存在方向性分歧、需主 Agent 拍板时                                           |
+| **verify_implementation**| 在 git worktree 隔离副本中设计并执行测试，产出 ground truth（测试是否通过）+ 建议性 diff    | 想真正运行测试验证方案可行性，而非静态分析；改动不落盘主仓库，交主 Agent 审批合并  |
 
-> 所有副 Agent 均以只读模式运行，永远不会修改你的文件（plan 模式或 default 模式 + 工具白/黑名单双重护栏，详见下文）。
+> 副 Agent 按三级能力阶梯运行：Tier 0（纯文本融合，走 API 直连）、Tier 1（只读探索，default+白名单+黑名单）、Tier 2（worktree 隔离可写可执行）。Tier 0/1 的副 Agent 永远不会修改你的文件；Tier 2（verify_implementation）在隔离副本内可写，但改动以建议性 diff 交主 Agent 审批，主仓库工作树保持干净。详见下文。
 
 ---
 
@@ -63,7 +64,7 @@
 
 一句话：**几个国产中等模型组队，把顶级模型才能稳定发现的问题挖了出来。**
 
-> 成本与耗时：单次调用 **$0.11–$1.24**（走多模型合成/强模型求助的路径偏高），单次耗时 **15–150 秒**（视是否触发多模型而定）。日常单模型审查通常在低位区间。
+> 成本与耗时：单次调用消耗 token 数因路径而异（走多模型合成/强模型求助的路径偏高，单模型审查在低位），单次耗时 **15–150 秒**（视是否触发多模型而定）。成本以 token 计数展示（端点无关），不再展示美元价格（不同用户用不同端点，美元无意义）。
 
 ---
 
@@ -245,37 +246,42 @@ cp profiles.example.json profiles.json
 
 ```
 AgentParliament/
-├── server.py              # MCP 服务接口层，9 个工具 handler
+├── server.py              # MCP 服务接口层，10 个工具 handler
 ├── prompts.py             # prompt 纯函数 + 记忆块注入
 ├── chain.py               # delegate_chain 编排 + delegate_dialogue session 管理 + 工具调度器
 ├── render.py              # 结果渲染 + 结构校验
-├── runner.py              # 执行层：子进程管理、失败链、环境隔离、熔断器
+├── runner.py              # 执行层：BaseRunner/CLIRunner/APIRunner、失败链、环境隔离、熔断器
+├── worktree_manager.py    # verify_implementation 的 git worktree 隔离环境生命周期管理
 ├── profiles.json          # 模型与角色配置（gitignore，含敏感 token）
 ├── profiles.example.json  # 配置模板（含 role_overrides 按角色覆盖超时）
 ├── mcp.config.json        # MCP 客户端配置模板
 ├── pyproject.toml         # 项目元数据与依赖
 ├── uv.lock                # uv 依赖锁定文件
-└── AgentPrompt.txt        # 配合 Trae 使用的四个 Agent 提示词
+└── docs/                  # ADR（架构决策记录）+ 方案文档
 ```
 
 ---
 
-## 配合 Trae 四个 Agent 使用（推荐）
+## 配合 agent-parliament plugin 使用（推荐）
 
-AgentParliament 本身是一个被调用的 MCP 工具；要让它发挥最大价值，推荐配合 Trae 中四个分工明确的角色 Agent 使用——它们在不同开发阶段介入，并在恰当时机调用本 MCP 的工具来交叉验证自己的判断。
+AgentParliament 本身是一个被调用的 MCP 工具；要让它发挥最大价值，推荐配合独立的 **agent-parliament plugin** 使用——它包含一个 orchestrator 调度总纲 + 五个分工角色的 skill（project-planner / code-developer / tester / untangler / memory-keeper），在不同开发阶段介入，指导何时调用本 MCP 的哪个工具来交叉验证。
 
-| Agent                                   | 职责                                                     | 介入阶段                                                     | 主要调用的工具                                                                |
-| --------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| **project_planner**（前期规划者） | 需求分析、调研、架构设计、前置风险                       | 动工前「先想清楚」                                           | `delegate_research(allow_web=True)`、`validate_approach`、`consensus`   |
-| **code_developer**（代码开发者）  | 按既定方案做最小必要、可维护的实现与修复                 | 实现与改 bug                                                 | `peer_review`、`validate_approach`、`test_audit`、`delegate_research` |
-| **untangler**（纾困复盘者）       | 卡顿时跳出泥潭、理清现状、判断方向                       | 反复修补无果、方向模糊时                                     | `independent_analysis`、`consensus`、`delegate_research`                |
-| **memory_keeper**（文档管理者）   | 守护记忆体文档质量：巡检、补漏、消解矛盾、精简、处置污染 | 一个开发阶段结束、怀疑文档与代码不一致、记忆体膨胀或被污染时 | `delegate_research`、`independent_analysis`、`peer_review`              |
+| Skill | 角色 | 介入阶段 | 主要调用的工具 |
+|---|---|---|---|
+| `orchestrator` | 调度总纲 | 着手项目/较大功能，不确定用哪个角色 | （路由层，不直接调工具） |
+| `project-planner` | 前期规划 | 动工前需求分析、调研、架构设计 | `delegate_research(allow_web=True)`、`validate_approach`、`consensus` |
+| `code-developer` | 代码开发 | 把方案落地为代码、改 bug | `peer_review`、`validate_approach`、`test_audit`、`delegate_research` |
+| `tester` | 攻防验证 | 从外部攻击已交付的产出 | `verify_implementation`、`peer_review`、`test_audit`、`independent_analysis` |
+| `untangler` | 纾困复盘 | 卡住、反复修补无果、方向混沌 | `independent_analysis`、`consensus`、`delegate_research` |
+| `memory-keeper` | 文档管理 | 阶段结束归档、文档与代码不一致 | `delegate_research`、`independent_analysis`、`peer_review` |
 
-> **delegate_chain** 和 **delegate_dialogue** 是跨角色工具：当 code_developer、untangler 或 project_planner 面对需要完整链路深入思考的重要决策时，可用 delegate_chain 将多个原子工具串成思考链；当调研中存在方向性分歧、需主 Agent 拍板时，可用 delegate_dialogue 进行多轮对话。日常场景仍使用上表中的原子工具。
+> **tester 与 code-developer 构成"构建-验证"闭环**：code-developer 交付前用 peer_review 自审自己的 diff，tester 从外部用同样的工具攻击别人的 diff——调用主体变了，确认偏差就被打破。tester 的核心是"攻击别人的产出而非自审"，内化了分层攻击清单、稳态假设、Mutation 视角，且不修复（修复回流 code-developer）。
 
-四个 Agent 的完整提示词与「何时调用」说明见 [`AgentPrompt.txt`](AgentPrompt.txt)，可直接整段粘贴到 Trae 的 Agent 设置中。它们共享一条铁律：**MCP 工具用来交叉验证、不替代自己思考——先有自己的结论，再用工具印证或证伪。** 同时四者都会在工作前读取项目根目录的 `CLAUDE.md` 共享记忆体，与本 MCP 的记忆注入机制形成闭环。
+> **delegate_chain** 和 **delegate_dialogue** 是跨角色工具：面对需要完整链路深入思考的重要决策时，可用 delegate_chain 将多个原子工具串成思考链；当调研中存在方向性分歧、需主 Agent 拍板时，可用 delegate_dialogue 进行多轮对话。日常场景仍使用上表中的原子工具。
 
-> 这套角色分工是可选的。你也可以在任意支持 MCP 的客户端里直接调用这 9 个工具，不依赖上述 Agent。
+plugin 的 skill 定义"遇到这种情况调哪个工具"（工具调度指南），角色人格（立场、信念、身份）由各客户端的 subagent / agent 配置定义。两者配合使用。六个 skill 共享一条铁律：**MCP 工具用来交叉验证、不替代自己思考——先有自己的结论，再用工具印证或证伪。** 同时都会在工作前读取项目根目录的 `CLAUDE.md` 共享记忆体，与本 MCP 的记忆注入机制形成闭环。
+
+> 这套角色分工是可选的。你也可以在任意支持 MCP 的客户端里直接调用这 10 个工具，不依赖 plugin。
 
 ---
 

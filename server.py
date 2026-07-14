@@ -1,7 +1,7 @@
 """
 server.py——AgentParliament的MCP入口
 
-通过stdio暴露9个工具给主Agent：
+通过stdio暴露10个工具给主Agent：
 1. delegate_research   —— 调研：把问题与相关文件交给副模型调研，回传结论
 2. peer_review         —— 代码审查：把git diff交给副模型审查，回传分级问题
 3. independent_analysis—— 独立分析：让第三方模型批判性审视已有结论，找盲区与漏洞
@@ -11,12 +11,16 @@ server.py——AgentParliament的MCP入口
 7. advisor_analysis    —— 战略求助：中等模型先出草稿，不确定或高风险时条件升级求助强模型
 8. delegate_chain      —— 多步推理链：主Agent定义多步思维链结构，server.py依次执行；链内子Agent可全文件读取
 9. delegate_dialogue   —— 带对话能力的调研：子Agent可通过[ASK_PARENT]标记向主Agent提问，主Agent带session_id+answer续答
+10. verify_implementation —— 隔离执行验证：在git worktree隔离副本内设计并执行测试，产出ground truth + 建议性diff
 
-所有工具的副Agent都以只读模式运行，不会修改任何文件；改文件的动作始终留在主进程，由用户审阅后执行
-- peer_review / independent_analysis / consensus / validate_approach / test_audit / advisor_analysis：
-  使用 --permission-mode plan（Claude Code内置禁止所有写操作）
-- delegate_research：使用 --permission-mode default + 显式只读工具白名单 + 写操作黑名单
-  （plan模式的"提案后等待人类审批"语义会让headless单轮调研卡在"等待审阅"，故改用default模式）
+副Agent按三级能力阶梯运行，改文件的最终审批权始终留在主进程：
+- Tier 1（只读探索）：delegate_research / independent_analysis / validate_approach / test_audit / delegate_dialogue
+  使用 --permission-mode default + 只读工具白名单（Read/Grep/Glob及只读Bash子命令）+ 写操作黑名单双重护栏
+  （plan模式的"提案后等待人类审批"语义会让headless单轮调用卡在"等待审阅"，故改用default模式）
+- Tier 0（纯文本）：peer_review 仍用 --permission-mode plan（材料随prompt给全，无需读文件）；
+  consensus的synthesize合成、advisor_analysis的强模型升级走API直连（run_with_chain_api）
+- Tier 2（隔离可写可执行）：verify_implementation 在git worktree隔离副本内可写可执行，
+  改动以建议性diff交主Agent审批，主仓库工作树保持干净
 
 共享记忆：每个工具调用前会显式读取副Agent工作目录下的CLAUDE.md（项目共享记忆体），
 注入到prompt开头，使副Agent确定性地获得项目的领域语言、已定架构决策与硬约束，
@@ -36,6 +40,7 @@ from runner import (
     ProfileError,
     run_parallel,
     run_with_chain,
+    run_with_chain_api,
 )
 from prompts import (
     _build_advisor_draft_prompt,
@@ -45,11 +50,13 @@ from prompts import (
     _build_review_prompt,
     _build_test_audit_full_prompt,
     _build_validate_approach_prompt,
+    _build_verify_implementation_prompt,
     _memory_block,
     _NEED_ADVISOR_TAG,
     _READONLY_NOTICE,
 )
 from render import (
+    _fmt_tokens,
     _format_parallel_result,
     _format_result,
     _project_dir_warning,
@@ -60,12 +67,15 @@ from chain import (
     _DIFF_SIZE_LIMIT,
     _RESEARCH_TOOLS_LOCAL,
     _RESEARCH_TOOLS_WEB,
+    _VERIFY_TOOLS,
+    _VERIFY_DISALLOWED_TOOLS,
     _execute_delegate_chain,
     _execute_delegate_dialogue,
     _extra_dirs_from_files,
     _get_config,
     _resolve_cwd,
 )
+from worktree_manager import WorktreeSession, WorktreeError
 
 mcp = FastMCP("AgentParliament")
 
@@ -230,6 +240,9 @@ async def independent_analysis(
             prompt=_memory_block(cwd) + prompt,
             cwd=cwd,
             extra_dirs=extra_dirs,
+            allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+            permission_mode="default",
+            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
@@ -299,8 +312,9 @@ async def consensus(
             sections.append(f"### 模型：{r.model_name}（失败）\n{r.error}")
 
     header = f"[AgentParliament]{len(parallel.successful)}/{len(parallel.results)}个模型成功完成。"
-    if parallel.total_cost_usd > 0:
-        header += f" 总成本：${parallel.total_cost_usd:.4f}"
+    usage = _fmt_tokens(parallel.total_input_tokens, parallel.total_output_tokens)
+    if usage:
+        header += f" 总用量：{usage}"
     header += "\n以下是各模型的独立回答，请由主Agent自行对比共识与分歧。"
 
     # synthesize=False：现有行为不变，各模型回答原样拼接由主Agent自己综合
@@ -326,7 +340,7 @@ async def consensus(
 
     try:
         synth_result = await asyncio.to_thread(
-            run_with_chain,
+            run_with_chain_api,
             config=_get_config(),
             role=aggregator_role,
             prompt=_memory_block(cwd) + synth_prompt,
@@ -355,9 +369,11 @@ async def consensus(
     )
     if synth_result.degraded:
         synth_header += "\n注意：合成首选模型不可用，已降级。"
-    total_cost = parallel.total_cost_usd + synth_result.total_cost_usd
-    if total_cost > 0:
-        synth_header += f" 本次总成本：${total_cost:.4f}"
+    total_in = parallel.total_input_tokens + synth_result.total_input_tokens
+    total_out = parallel.total_output_tokens + synth_result.total_output_tokens
+    synth_usage = _fmt_tokens(total_in, total_out)
+    if synth_usage:
+        synth_header += f" 本次总用量：{synth_usage}"
 
     return (
         _project_dir_warning(project_dir)
@@ -402,6 +418,9 @@ async def validate_approach(
             prompt=_memory_block(cwd) + prompt,
             cwd=cwd,
             extra_dirs=extra_dirs,
+            allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+            permission_mode="default",
+            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
@@ -447,6 +466,9 @@ async def test_audit(
             prompt=_memory_block(cwd) + prompt,
             cwd=cwd,
             extra_dirs=extra_dirs,
+            allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+            permission_mode="default",
+            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return f"[AgentParliament] 配置或调用错误：{exc}"
@@ -521,7 +543,7 @@ async def advisor_analysis(
 
     try:
         advisor = await asyncio.to_thread(
-            run_with_chain,
+            run_with_chain_api,
             config=_get_config(),
             role=advisor_role,
             prompt=_memory_block(cwd) + advisor_prompt,
@@ -620,6 +642,113 @@ async def delegate_dialogue(
         question, project_dir, role, context_files, allow_web,
         session_id, answer, max_dialogue,
     )
+
+# 工具 10：verify_implementation（Tier 2 隔离可写可执行）
+@mcp.tool()
+async def verify_implementation(
+    task: str,
+    project_dir: str,
+    role: str = "reviewer",
+    test_command: str = "",
+    focus: str = "",
+) -> str:
+    """
+    在 git worktree 隔离副本中，让子Agent设计并执行测试，验证一个方案/实现是否真的可行。
+    产出 ground truth：测试是否真的通过 + 建议性 diff（不直接落盘主仓库）。
+
+    与 test_audit 的区别：test_audit 只做静态分析（读源码给"应该测什么"的建议，便宜安全随时可用）；
+    本工具在隔离副本里真正运行测试，产出"测试是否通过"的 ground truth（依赖 worktree 隔离，开销更大）。
+
+    [安全边界] worktree 隔离的是文件树，不是操作系统进程。子Agent在副本内执行的代码
+    理论上仍可访问副本之外的文件系统、可联网。这是"运行不完全受控代码"的实质风险，
+    主Agent拿到的是建议性 diff，是否合并由主Agent（最终由用户）决定。
+
+    Args:
+        task: 要验证的实现任务，如"给 runner.py 加熔断器""验证新的缓存方案"
+        project_dir: 项目根目录，作为创建 worktree 的基准（必须传入真实项目根目录）
+        role: 使用哪条角色失败链，默认"reviewer"
+        test_command: 可选，指定测试命令（如"pytest tests/"）。不传则让子Agent自行决定
+        focus: 可选，验证重点（如"并发安全""边界条件"）
+
+    Returns:
+        验证报告：含测试结论、测试输出、建议性 diff。子Agent的改动不落盘主仓库。
+        worktree创建失败时返回错误，不阻断主流程。
+    """
+    project_dir_warning = _project_dir_warning(project_dir)
+
+    # 1. 创建 worktree（失败则返回错误，不阻断主流程）
+    try:
+        resolved_base = _resolve_cwd(project_dir)
+    except ProfileError as exc:
+        return f"[AgentParliament] 配置或调用错误：{exc}"
+
+    try:
+        wt = WorktreeSession(resolved_base)
+        wt_path = wt.create()
+    except WorktreeError as exc:
+        return (
+            project_dir_warning
+            + f"[AgentParliament] worktree 创建失败，无法执行验证：{exc}"
+        )
+
+    # 2. 在 worktree 内启动子 Agent（default 模式 + Tier 2 工具集）
+    # cwd 指向 worktree，子 Agent 的所有改动都落在这个隔离副本里
+    # memory_block 读的是 worktree 内的 CLAUDE.md（worktree 共享 git 状态，CLAUDE.md 会被带过去）
+    prompt = _memory_block(wt_path) + _build_verify_implementation_prompt(task, test_command, focus)
+
+    try:
+        result = await asyncio.to_thread(
+            run_with_chain,
+            config=_get_config(),
+            role=role,
+            prompt=prompt,
+            cwd=wt_path,
+            allowed_tools=list(_VERIFY_TOOLS),
+            permission_mode="default",
+            disallowed_tools=_VERIFY_DISALLOWED_TOOLS,
+            # Tier 2 专属：worktree 已隔离文件树 + 快照保证主仓库不受影响，
+            # 故跳过 headless 无法交互的权限审批，让子 Agent 能真正跑 pytest（问题1）。
+            # 只读工具集(_VERIFY_DISALLOWED_TOOLS 黑名单)仍作为纵深防御保留。
+            dangerously_skip_permissions=True,
+        )
+    except ProfileError as exc:
+        wt.destroy()
+        return f"[AgentParliament] 配置或调用错误：{exc}"
+
+    # 3. 提取建议性 diff（子 Agent 在 worktree 内的所有改动）
+    suggested_diff = ""
+    try:
+        suggested_diff = wt.get_diff()
+    except Exception:
+        pass  # diff 提取失败不阻断，主结论仍可用
+
+    # 4. 销毁 worktree（无论成功失败都清理）
+    wt.destroy()
+
+    # 5. 渲染结果
+    header = project_dir_warning
+    if not result.ok:
+        return header + _format_result(result)
+
+    # 快照状态标注：让主 Agent 知道验证的是"当前真实代码（含未提交改动）"还是"仅已提交代码"
+    # snapshot_used=False 时验证结论可能对着旧代码，需明确告警避免误信 ground truth
+    if wt.snapshot_used:
+        snapshot_note = "[验证基准] 已包含主仓库未提交改动，验证的是当前真实代码状态。\n\n"
+    else:
+        snapshot_note = (
+            "[验证基准] ⚠️ 快照未生成，本次基于最近一次提交（HEAD）验证，"
+            "未包含工作区未提交改动。若你要验证的是尚未 commit 的实现，结论可能对着旧代码，请谨慎采信。\n\n"
+        )
+
+    rendered = _format_result(result)
+    diff_section = ""
+    if suggested_diff.strip():
+        diff_section = (
+            "\n\n———— 建议性 diff（子 Agent 在隔离副本内的改动，交你审批是否合并）————\n"
+            f"```diff\n{suggested_diff}\n```"
+        )
+
+    return header + snapshot_note + rendered + diff_section
 
 def main() -> None:
     """ 以stdio方式启动MCP服务，供命令行入口（pyproject.toml的scripts）与直接运行共用 """

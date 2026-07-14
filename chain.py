@@ -29,6 +29,7 @@ from runner import (
     RunResult,
     load_config,
     run_with_chain,
+    run_with_chain_api,
     run_parallel,
 )
 from prompts import (
@@ -39,6 +40,7 @@ from prompts import (
     _build_review_prompt,
     _build_test_audit_full_prompt,
     _build_validate_approach_prompt,
+    _build_verify_implementation_prompt,
     _memory_block,
     _NEED_ADVISOR_TAG,
     _READONLY_NOTICE,
@@ -49,6 +51,7 @@ from prompts import (
 from render import (
     _chain_error,
     _chain_result_from_run,
+    _fmt_tokens,
     _project_dir_warning,
     _render_chain_result,
     _truncate_for_chain,
@@ -57,6 +60,7 @@ from render import (
     _format_dialogue_final,
     _format_result,
 )
+from worktree_manager import WorktreeSession, WorktreeError
 
 # prompt改由stdin传入后已无命令行长度限制，此处仅保留一个宽松上限防止极端输入耗尽内存
 _DIFF_SIZE_LIMIT = 200000
@@ -111,6 +115,25 @@ _RESEARCH_TOOLS_LOCAL = [
 ]
 _RESEARCH_TOOLS_WEB = list(_RESEARCH_TOOLS_LOCAL) + ["WebSearch", "WebFetch"]
 
+# verify_implementation使用的 Tier 2 工具集：在 worktree 隔离副本内可写可执行
+# 开放 Write/Edit（写测试文件）+ 常见测试/构建命令的白名单子命令
+# 仍禁止危险操作：rm/push/网络写入等，通过 _VERIFY_DISALLOWED_TOOLS 黑名单兜底
+_VERIFY_TOOLS = [
+    "Read", "Grep", "Glob",
+    "Write", "Edit",
+    "Bash(ls:*)", "Bash(dir:*)", "Bash(find:*)", "Bash(wc:*)", "Bash(cat:*)", "Bash(tree:*)",
+    "Bash(python:*)", "Bash(python3:*)", "Bash(py:*)", "Bash(pytest:*)", "Bash(pytest8:*)",
+    "Bash(pip:*)", "Bash(uv:*)", "Bash(node:*)", "Bash(npm:*)", "Bash(npx:*)",
+    "Bash(go:*)", "Bash(cargo:*)", "Bash(make:*)", "Bash(cmake:*)",
+    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+]
+# Tier 2 的黑名单：禁止破坏性/外联操作。注意不含裸 Bash/Write/Edit（这些在白名单里按子命令放行）
+_VERIFY_DISALLOWED_TOOLS = [
+    "Bash(rm:*)", "Bash(rmdir:*)", "Bash(del:*)",
+    "Bash(git push:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)",
+    "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(scp:*)",
+]
+
 # delegate_chain动态超时计算的膨胀系数增量。
 # 越靠后的步骤要处理越多累积信息（__PREVIOUS_RESULT__），实际耗时越长。
 # 第 i 步（从0开始）的膨胀系数 = 1.0 + i * INFLATION_FACTOR。
@@ -126,6 +149,7 @@ _DISALLOWED_TOOLS = ["Write", "Edit", "NotebookEdit", "Bash"]
 _ALLOWED_CHAIN_TOOLS = frozenset({
     "delegate_research", "peer_review", "independent_analysis",
     "consensus", "validate_approach", "test_audit", "advisor_analysis",
+    "verify_implementation",
 })
 
 async def _call_tool_by_name(
@@ -225,6 +249,9 @@ async def _call_tool_by_name(
                 run_with_chain,
                 config=config, role=role, prompt=memory + prompt,
                 cwd=cwd, extra_dirs=extra_dirs,
+                allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+                permission_mode="default",
+                disallowed_tools=_DISALLOWED_TOOLS,
             )
         except ProfileError as exc:
             return _chain_error(str(exc))
@@ -237,6 +264,9 @@ async def _call_tool_by_name(
                 run_with_chain,
                 config=config, role=role, prompt=memory + prompt,
                 cwd=cwd, extra_dirs=extra_dirs,
+                allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+                permission_mode="default",
+                disallowed_tools=_DISALLOWED_TOOLS,
             )
         except ProfileError as exc:
             return _chain_error(str(exc))
@@ -253,7 +283,10 @@ async def _call_tool_by_name(
         except ProfileError as exc:
             return _chain_error(str(exc))
         if parallel.all_failed:
-            return _chain_error("所有模型均失败", cost_usd=parallel.total_cost_usd)
+            return _chain_error(
+                "所有模型均失败", cost_usd=parallel.total_cost_usd,
+                input_tokens=parallel.total_input_tokens, output_tokens=parallel.total_output_tokens,
+            )
         # synthesize 在 delegate_chain 内部不作为独立步骤处理，这里按 synthesize=False 返回拼接
         sections = []
         for r in parallel.results:
@@ -262,12 +295,14 @@ async def _call_tool_by_name(
             else:
                 sections.append(f"### 模型：{r.model_name}（失败）\n{r.error}")
         header = f"[AgentParliament]{len(parallel.successful)}/{len(parallel.results)}个模型成功完成。"
-        if parallel.total_cost_usd > 0:
-            header += f" 总成本：${parallel.total_cost_usd:.4f}"
+        usage = _fmt_tokens(parallel.total_input_tokens, parallel.total_output_tokens)
+        if usage:
+            header += f" 总用量：{usage}"
         header += "\n以下是各模型的独立回答，请由链的下一步或综合步骤对比共识与分歧。"
         return {
             "ok": True, "text": f"{header}\n\n" + "\n\n---\n\n".join(sections),
             "model_used": "parallel", "cost_usd": parallel.total_cost_usd,
+            "input_tokens": parallel.total_input_tokens, "output_tokens": parallel.total_output_tokens,
         }
 
     if tool_name == "test_audit":
@@ -279,6 +314,9 @@ async def _call_tool_by_name(
                 run_with_chain,
                 config=config, role=role, prompt=memory + prompt,
                 cwd=cwd, extra_dirs=audit_dirs,
+                allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
+                permission_mode="default",
+                disallowed_tools=_DISALLOWED_TOOLS,
             )
         except ProfileError as exc:
             return _chain_error(str(exc))
@@ -307,29 +345,100 @@ async def _call_tool_by_name(
             "你作为资深顾问，请审查草稿：若草稿正确请明确认可并补充论据；"
             "若有问题请指出并给出修正后的权威结论。"
         )
+        # 顾问阶段是纯文本融合（task + draft.text），走 API 直连
         try:
             advisor = await asyncio.to_thread(
-                run_with_chain,
+                run_with_chain_api,
                 config=config, role=advisor_role, prompt=memory + advisor_prompt,
-                cwd=cwd, extra_dirs=extra_dirs,
+                cwd=cwd,
             )
         except ProfileError as exc:
             # 强模型升级失败：返回草稿并标注求助失败（ok=True，因为有草稿可用）
             return {
                 "ok": True, "text": draft.text,
                 "model_used": draft.model_used, "cost_usd": draft.total_cost_usd,
+                "input_tokens": draft.total_input_tokens, "output_tokens": draft.total_output_tokens,
                 "error": f"强模型升级失败，返回草稿：{exc}",
             }
         if not advisor.ok:
             return {
                 "ok": True, "text": draft.text,
                 "model_used": draft.model_used, "cost_usd": draft.total_cost_usd,
+                "input_tokens": draft.total_input_tokens, "output_tokens": draft.total_output_tokens,
                 "error": "顾问模型失败，返回草稿",
             }
         return {
             "ok": True,
             "text": "【阶段1：中等模型草稿】\n" + draft.text + "\n\n【阶段2：强模型顾问意见】\n" + advisor.text,
             "model_used": advisor.model_used, "cost_usd": draft.total_cost_usd + advisor.total_cost_usd,
+            "input_tokens": draft.total_input_tokens + advisor.total_input_tokens,
+            "output_tokens": draft.total_output_tokens + advisor.total_output_tokens,
+        }
+
+    if tool_name == "verify_implementation":
+        # Tier 2：在 git worktree 隔离副本内设计并执行测试，产出 ground truth
+        # task 是 verify_implementation 的主参数（advisor_analysis 也用 task，这里语义一致）
+        verify_task = task or question or original_task
+        if not verify_task:
+            return _chain_error("verify_implementation 缺少 task 参数（要验证的任务描述）")
+
+        # 创建 worktree（失败则返回错误，不阻断链路）
+        try:
+            wt = WorktreeSession(cwd)
+            wt_path = wt.create()
+        except WorktreeError as exc:
+            return _chain_error(f"worktree 创建失败：{exc}")
+
+        # 在 worktree 内启动子 Agent（default + Tier 2 工具集）
+        v_prompt = _build_verify_implementation_prompt(verify_task, "", "")
+        try:
+            result = await asyncio.to_thread(
+                run_with_chain,
+                config=config, role=role, prompt=memory + v_prompt,
+                cwd=wt_path,
+                allowed_tools=list(_VERIFY_TOOLS),
+                permission_mode="default",
+                disallowed_tools=_VERIFY_DISALLOWED_TOOLS,
+                dangerously_skip_permissions=True,
+            )
+        except ProfileError as exc:
+            wt.destroy()
+            return _chain_error(str(exc))
+
+        # 提取建议性 diff
+        suggested_diff = ""
+        try:
+            suggested_diff = wt.get_diff()
+        except Exception:
+            pass
+
+        # 销毁 worktree
+        wt.destroy()
+
+        if not result.ok:
+            return _chain_result_from_run(result)
+
+        # 快照状态标注：与 server.py 的 verify_implementation handler 保持一致
+        # 让链路结果也能反映"验证的是当前真实代码还是仅已提交代码"
+        if wt.snapshot_used:
+            snapshot_note = "[验证基准] 已包含主仓库未提交改动，验证的是当前真实代码状态。\n\n"
+        else:
+            snapshot_note = (
+                "[验证基准] ⚠️ 快照未生成，本次基于最近一次提交（HEAD）验证，"
+                "未包含工作区未提交改动，若验证尚未 commit 的实现结论可能对着旧代码。\n\n"
+            )
+
+        # 拼接结论 + 建议性 diff
+        text = snapshot_note + result.text
+        if suggested_diff.strip():
+            text += (
+                "\n\n---- 建议性 diff（子 Agent 在隔离副本内的改动，交主 Agent 审批是否合并）----\n"
+                f"```diff\n{suggested_diff}\n```"
+            )
+        return {
+            "ok": True, "text": text,
+            "model_used": result.model_used, "cost_usd": result.total_cost_usd,
+            "input_tokens": result.total_input_tokens, "output_tokens": result.total_output_tokens,
         }
 
     # 不可达防护（_ALLOWED_CHAIN_TOOLS 校验已确保不会到达这里）
@@ -401,26 +510,26 @@ async def _run_synthesize(
     )
     try:
         cwd = _resolve_cwd(project_dir)
+        # synthesize 综合步骤是纯文本融合（task + 各步 text），走 API 直连省去 CLI 子进程开销
+        # memory_block 是宿主进程预先读好的字符串，作为纯文本输入而非指令子进程读文件
         result = await asyncio.to_thread(
-            run_with_chain,
+            run_with_chain_api,
             config=_get_config(),
             role=aggregator_role,
             prompt=_memory_block(cwd) + synth_prompt,
             cwd=cwd,
-            # cwd 已是 project_dir，子 Agent 本就能读取项目文件，无需额外 --add-dir
-            extra_dirs=None,
-            # synthesize 综合步骤用 default + 只读白名单，避免 plan 模式的 "propose-and-halt" 语义让 headless 子 Agent 卡在 "等待审批"
-            allowed_tools=list(_RESEARCH_TOOLS_LOCAL),
-            permission_mode="default",
-            disallowed_tools=_DISALLOWED_TOOLS,
         )
     except ProfileError as exc:
         return _chain_error(str(exc))
 
     if not result.ok:
-        return _chain_error("综合模型失败", cost_usd=result.total_cost_usd)
+        return _chain_error(
+            "综合模型失败", cost_usd=result.total_cost_usd,
+            input_tokens=result.total_input_tokens, output_tokens=result.total_output_tokens,
+        )
     return {
         "ok": True, "text": result.text, "model_used": result.model_used, "cost_usd": result.total_cost_usd,
+        "input_tokens": result.total_input_tokens, "output_tokens": result.total_output_tokens,
     }
 
 async def _execute_delegate_chain(
@@ -456,6 +565,8 @@ async def _execute_delegate_chain(
 
     results: list[dict] = []
     total_cost = 0.0
+    total_in = 0
+    total_out = 0
     chain_start = time.monotonic()
 
     for i, stage in enumerate(stages):
@@ -470,6 +581,7 @@ async def _execute_delegate_chain(
                     f"（{len(stages)}步链路，膨胀系数 {INFLATION_FACTOR}）。"
                     f"已完成 {i}/{len(stages)} 步。"
                 ),
+                total_input_tokens=total_in, total_output_tokens=total_out,
             )
 
         tool_name = stage.get("tool", "")
@@ -495,6 +607,9 @@ async def _execute_delegate_chain(
             return f"[AgentParliament]delegate_chain 步骤 {i+1}（peer_review）缺少 diff 参数。"
         if tool_name == "test_audit" and "source_files" not in tool_kwargs:
             return f"[AgentParliament]delegate_chain 步骤 {i+1}（test_audit）缺少 source_files 参数。"
+        if tool_name == "verify_implementation" and not tool_kwargs.get("task") and not tool_kwargs.get("question") and not tool_kwargs.get("original_task"):
+            # 未提供 task 时用链路整体 task 自动填充
+            tool_kwargs["task"] = task
 
         # __PREVIOUS_RESULT__和__TASK__占位符替换
         previous_text = results[-1]["text"] if results else ""
@@ -537,6 +652,15 @@ async def _execute_delegate_chain(
                 tool_kwargs["question"] = f"{task}\n\n{enriched}" if enriched else task
             elif enriched:
                 tool_kwargs["question"] = f"{tool_kwargs['question']}\n\n{enriched}"
+        elif tool_name == "verify_implementation":
+            # verify 用 task 字段，自动填充逻辑与 advisor 一致；enriched 追加为补充说明
+            if "task" not in tool_kwargs:
+                tool_kwargs["task"] = f"{task}\n\n{enriched}" if enriched else task
+            elif enriched:
+                tool_kwargs["task"] = f"{tool_kwargs['task']}\n\n{enriched}"
+            # focus 可由 enriched 补充（若 stage 未指定 focus）
+            if enriched and "focus" not in tool_kwargs:
+                tool_kwargs["focus"] = enriched
 
         step_result = await _call_tool_by_name(
             tool_name, project_dir=project_dir, role=stage_role,
@@ -544,9 +668,14 @@ async def _execute_delegate_chain(
         )
         results.append(step_result)
         total_cost += step_result.get("cost_usd", 0.0)
+        total_in += step_result.get("input_tokens", 0) or 0
+        total_out += step_result.get("output_tokens", 0) or 0
 
         if not step_result["ok"]:
-            return _render_chain_result(task, results, total_cost, failed_at=i, project_dir_warning=project_dir_warning)
+            return _render_chain_result(
+                task, results, total_cost, failed_at=i, project_dir_warning=project_dir_warning,
+                total_input_tokens=total_in, total_output_tokens=total_out,
+            )
 
     # synthesize 综合步骤（也受动态超时约束）
     if synthesize:
@@ -560,14 +689,23 @@ async def _execute_delegate_chain(
                     f"（{len(stages)}步链路，膨胀系数 {INFLATION_FACTOR}）。"
                     f"已完成 {len(stages)}/{len(stages)} 步，综合步骤未执行。"
                 ),
+                total_input_tokens=total_in, total_output_tokens=total_out,
             )
         synth_result = await _run_synthesize(task, results, project_dir, aggregator_role)
         results.append(synth_result)
         total_cost += synth_result.get("cost_usd", 0.0)
+        total_in += synth_result.get("input_tokens", 0) or 0
+        total_out += synth_result.get("output_tokens", 0) or 0
         if not synth_result["ok"]:
-            return _render_chain_result(task, results, total_cost, failed_at=len(stages), project_dir_warning=project_dir_warning)
+            return _render_chain_result(
+                task, results, total_cost, failed_at=len(stages), project_dir_warning=project_dir_warning,
+                total_input_tokens=total_in, total_output_tokens=total_out,
+            )
 
-    return _render_chain_result(task, results, total_cost, project_dir_warning=project_dir_warning)
+    return _render_chain_result(
+        task, results, total_cost, project_dir_warning=project_dir_warning,
+        total_input_tokens=total_in, total_output_tokens=total_out,
+    )
 
 
 # ─── delegate_dialogue session 管理与编排 ────────────────────────────
@@ -693,7 +831,7 @@ async def _execute_delegate_dialogue(
         if session["turns"] >= max_dialogue:
             _close_session(session_id)
             return _format_dialogue_final(
-                session["prev_conclusion"], None, 0.0,
+                session["prev_conclusion"], None, None, None,
                 session["history"], project_dir_warning,
             ) + "\n\n（已达对话上限，取子Agent上一轮结论）"
         # 截断prev_conclusion防续答轮prompt膨胀导致单轮超时
@@ -761,7 +899,7 @@ async def _execute_delegate_dialogue(
         _append_history(session_id, {"turn": new_turns, "question": ask_question, "answer": ""})
         return _format_ask_response(
             session_id, ask_question, conclusion, new_turns, max_dialogue, result.model_used,
-            result.total_cost_usd,
+            result.total_input_tokens, result.total_output_tokens,
         )
 
     # 无提问或达上限：先记录达上限轮的未回答提问，再取history关闭
@@ -772,6 +910,6 @@ async def _execute_delegate_dialogue(
     history = closed["history"] if closed else []
     suffix = "\n\n（已达对话上限 max_dialogue，子Agent仍想提问，取其当前结论）" if reached_limit else ""
     return _format_dialogue_final(
-        conclusion, result.model_used, result.total_cost_usd,
+        conclusion, result.model_used, result.total_input_tokens, result.total_output_tokens,
         history, project_dir_warning, truncated=truncated,
     ) + suffix

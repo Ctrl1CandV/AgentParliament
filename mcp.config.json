@@ -7,7 +7,7 @@
       "args": [
         "run",
         "--directory",
-        "d:\\Liu Project\\AgentParliament",
+        "d:\\AgentParliament",
         "agent-parliament"
       ]
     }

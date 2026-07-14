@@ -2,7 +2,7 @@
 prompts.py——AgentParliament的prompt构造与共享记忆体注入
 
 职责：
-1. 构造8个原子工具的完整prompt（纯函数，供server.py的工具handler与chain.py的_call_tool_by_name复用，
+1. 构造各工具的完整prompt（纯函数，供server.py的工具handler与chain.py的_call_tool_by_name复用，
    保证单工具调用与链内调用产出完全一致）
 2. 读取副Agent工作目录下的CLAUDE.md/SPEC.md/docs/adr，渲染成注入prompt开头的记忆块
    （显式注入而非依赖Claude Code自动加载，确保headless模式下副Agent确定性地获得项目上下文）
@@ -16,16 +16,26 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-# 副Agent以只读plan模式运行，无法写文件。明确告知以抑制幻觉回复
+# 副Agent以只读模式运行（plan或default+只读白名单），无法写文件。明确告知以抑制幻觉回复
+# 文案不提及具体运行模式：peer_review仍用plan模式，迁移到default的工具共用此notice，二者都不能写
 _READONLY_NOTICE = (
-    "\n\n[重要提醒] 你处于只读plan模式，无法创建、修改或删除任何文件。"
+    "\n\n[重要提醒] 你只能读取文件，无法创建、修改或删除任何文件。"
     "不要在回复中声称已创建文件或已写入内容，直接输出你的分析文本即可。"
 )
 
-# 审查/分析类工具的全部材料已随prompt给出，约束副Agent不要跑去读cwd里的文件而忽略prompt内容
+# 审查类工具（peer_review）的全部材料已随prompt给出，约束副Agent聚焦diff而非跑去读cwd文件
+# 仅供设计意图就是"只看材料"的场景使用；分析类工具改用下方的_EXPLORATION_NOTICE
 _MATERIAL_NOTICE = (
-    "[约束] 全部待审查/分析的材料已在下方完整给出，"
-    "请直接基于下方内容工作，无需也不要读取任何文件。\n\n"
+    "[约束] 全部待审查的材料已在下方完整给出，"
+    "请直接基于下方内容工作，无需读取任何文件。\n\n"
+)
+
+# 分析类工具的探索型引导：材料已在下方给出，但允许并鼓励主动读代码核实
+# 用于independent_analysis/validate_approach不传context_files时，替代原_MATERIAL_NOTICE的"禁止读文件"嘴套
+_EXPLORATION_NOTICE = (
+    "[说明] 主要材料已在下方给出，作为你分析的起点。"
+    "如需核实实现细节、查找相关定义或验证结论是否属实，"
+    "你可以主动读取相关代码文件——这能让你的分析更扎实。\n\n"
 )
 
 # 压制plan/default模式下副Agent"停下来等待审批"的行为
@@ -271,10 +281,12 @@ def _build_independent_analysis_prompt(
 ) -> str:
     """
     构造independent_analysis完整prompt
-    当context_files非空时，prefix从禁止读文件改为引导阅读+允许自主扩展
-    为空时保持_MATERIAL_NOTICE
+    无论是否传context_files，都允许并鼓励主动读代码核实结论真实性（Tier 1探索能力）：
+    - 有context_files：给出推荐入口文件
+    - 无context_files：用_EXPLORATION_NOTICE允许基于下方材料自由扩展探索
+    两者都替代了旧的"禁止读文件"嘴套
     """
-    prefix = _MATERIAL_NOTICE
+    prefix = _EXPLORATION_NOTICE
     if context_files:
         joined = "\n".join(f"- {p}" for p in context_files)
         prefix = (
@@ -309,6 +321,7 @@ def _build_independent_analysis_prompt(
         f"已有结论：{existing_result}"
         f"{concern_block}"
         f"{_READONLY_NOTICE}"
+        f"{_NO_HALT_NOTICE}"
     )
 
 def _build_validate_approach_prompt(
@@ -318,9 +331,11 @@ def _build_validate_approach_prompt(
 ) -> str:
     """
     构造validate_approach完整prompt
-    当context_files非空时，增加引导阅读上下文文件的段落
+    无论是否传context_files，都允许主动读代码核实方案可行性（Tier 1探索能力）：
+    - 有context_files：给出推荐入口文件
+    - 无context_files：用_EXPLORATION_NOTICE允许自由探索现有实现
     """
-    ctx_block = ""
+    ctx_block = _EXPLORATION_NOTICE
     if context_files:
         joined = "\n".join(f"- {p}" for p in context_files)
         ctx_block = (
@@ -352,6 +367,7 @@ def _build_validate_approach_prompt(
         f"待验证的方案：{approach}"
         f"{goal_block}"
         f"{_READONLY_NOTICE}"
+        f"{_NO_HALT_NOTICE}"
     )
 
 def _build_consensus_prompt(
@@ -428,6 +444,7 @@ def _build_test_audit_full_prompt(
         "4.【建议用例】针对缺失场景，给出具体的测试用例描述（输入、预期输出、验证点）\n"
         "5.【总体评价】当前测试充分度（充分/基本充分/不足），以及优先补充建议"
         f"{_READONLY_NOTICE}"
+        f"{_NO_HALT_NOTICE}"
     )
 
 def _build_advisor_draft_prompt(
@@ -505,3 +522,61 @@ def _build_dialogue_continue_prompt(
         f"若仍有需主Agent确认的方向，可再次输出 {_ASK_PARENT_TAG} 问题。"
         f"{_NO_HALT_NOTICE}"
     )
+
+
+# ─── verify_implementation（Tier 2 隔离可写可执行）──────────────────
+# 这个工具的子 Agent 在 git worktree 隔离副本内工作，拥有 Write/Edit/Bash(测试命令) 权限。
+# 目标：设计并执行测试，验证一个方案/实现是否真的可行，产出 ground truth（测试是否通过）。
+
+# verify_implementation 专用 notice：告知子 Agent 它处于可写可执行的隔离环境，
+# 与只读工具的 _READONLY_NOTICE 不同——这里明确允许写文件和执行命令
+_SANDBOX_NOTICE = (
+    "\n\n[环境说明] 你在一个隔离的工作副本（git worktree）中运行，"
+    "拥有完整文件读写权限和命令执行权限。"
+    "你可以新建测试文件、修改源码、运行测试命令（如 pytest/python）。"
+    "你在工作副本内的所有改动都不会影响主仓库——它们会被提取为建议性 diff，交主 Agent 审批。"
+)
+
+def _build_verify_implementation_prompt(
+    task: str,
+    test_command: str,
+    focus: str,
+) -> str:
+    """
+    构造 verify_implementation 完整 prompt
+    引导子 Agent：读懂要验证的代码 → 设计测试 → 写测试文件 → 运行测试 → 报告 ground truth
+    test_command 为空时让子 Agent 自行决定如何运行测试
+    """
+    test_cmd_section = (
+        f"请使用以下命令运行测试：\n```\n{test_command}\n```\n\n"
+        if test_command
+        else "请自行决定如何运行测试（根据项目使用的测试框架，如 pytest/unittest/go test 等）。\n\n"
+    )
+
+    focus_line = f"本次验证重点：{focus}\n\n" if focus else ""
+
+    return (
+        "你是一名严谨的测试工程师，在一个隔离的工作副本中工作。"
+        "你的任务是设计并实际执行测试，验证一个实现/方案是否真的可行。\n\n"
+        "工作流程：\n"
+        "1. 先阅读相关源码，理解要验证的逻辑和它应有的行为\n"
+        "2. 设计能覆盖核心逻辑、边界条件和异常路径的测试用例\n"
+        "3. 在工作副本中创建测试文件（可新建，也可修改现有测试）\n"
+        "4. 运行测试，捕获完整的测试输出（通过/失败/错误信息）\n"
+        "5. 如果测试失败，分析失败原因：是代码有 bug，还是测试本身写错了\n"
+        "6. 如有必要，修改源码修复发现的问题，重新运行测试确认修复\n\n"
+        f"{test_cmd_section}{focus_line}"
+        "请按以下结构输出你的最终结论：\n"
+        "1.【验证结论】测试是否全部通过（通过/失败/部分通过），一句话总结\n"
+        "2.【测试覆盖】你设计了哪些测试用例，覆盖了哪些场景\n"
+        "3.【测试输出】运行测试的完整输出（关键的通过/失败行，不要省略失败详情）\n"
+        "4.【发现问题】如果测试失败或发现 bug，详细描述：失败用例、期望值 vs 实际值、根因分析\n"
+        "5.【改动说明】你在工作副本中做了哪些改动（新建/修改了哪些文件，为什么）\n"
+        "6.【建议】对主 Agent 的建议：方案是否可行、是否需要调整、是否值得采纳你的改动\n\n"
+        "重要：你的价值是产出 ground truth（测试真的跑过了），而不是纸上谈兵。"
+        "即使测试失败，也是有价值的发现——失败本身就是在帮主 Agent 提前排雷。\n\n"
+        f"要验证的任务：{task}"
+        f"{_SANDBOX_NOTICE}"
+        f"{_NO_HALT_NOTICE}"
+    )
+
