@@ -58,19 +58,23 @@ _MEMORY_CHAR_LIMIT = 16000
 # SPEC.md和ADR增量注入的字符上限，防止挤占prompt预算
 _SPEC_BRIEF_LIMIT, _ADR_INDEX_LIMIT = 800, 400
 
-# SPEC.md固定二级标题名，用于标题匹配提取进度/下一步
-_SPEC_HEADINGS = ("## 执行方案", "## 进度", "## 下一步")
+# docs/SPEC.md 固定二级标题名，用于标题匹配提取进度/下一步
+# 与 plugin 的 memory-keeper skill 对齐：四标题缺一不可，代码靠精确匹配解析
+_SPEC_HEADINGS = ("## 执行方案", "## 进度", "## 下一步", "## 归档")
+
+# SPEC 文件相对路径：docs/SPEC.md（不放项目根，避免与 CLAUDE.md 混层）
+_SPEC_PATH = Path("docs") / "SPEC.md"
 
 # 匹配 CLAUDE.md中的ADR索引行，如"[ADR-001]选用asyncio.to_thread解决事件循环阻塞"
 _ADR_INDEX_PATTERN = re.compile(r"^\[ADR-\d+[^\]]*\].*$", re.MULTILINE)
 
 def _extract_spec_brief(cwd: str) -> str:
     """
-    从 SPEC.md 提取最新进度末条 + 下一步首行，作为轻量执行上下文注入副Agent
+    从 docs/SPEC.md 提取最新进度末条 + 下一步首行，作为轻量执行上下文注入副Agent
     用固定二级标题（## 进度 / ## 下一步）做匹配，而非脆弱的行数截取
     best-effort：文件不存在、标题不匹配、读取失败都返回空串
     """
-    spec_path = Path(cwd) / "SPEC.md"
+    spec_path = Path(cwd) / _SPEC_PATH
     try:
         if not spec_path.is_file():
             return ""

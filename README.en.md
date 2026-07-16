@@ -49,6 +49,7 @@ AgentParliament splits sub-agent capabilities into three tiers. Each tool explic
 | **delegate_research** | Delegate a read-only sub-agent to research and return structured conclusions | Complex questions needing a second perspective, or offloading research from the main context |
 | **peer_review** | Graded review of `git diff` (🔴critical/🟠major/🟡minor/🟢suggestion), supports `structured=True` JSON | Want another model to independently verify after implementation |
 | **independent_analysis** | Let a third-party model critically examine an existing conclusion for blind spots | Got a conclusion but still uncertain, want to verify reliability |
+| **consensus** | Parallel multi-model responses to the same question, auto-comparing consensus & dissent; optional `synthesize=True` for fused conclusion | Key decisions needing multi-model cross-validation |
 | **validate_approach** | Have a model play the adversary, finding holes in an architecture/plan | Stress-test a plan before implementation |
 | **test_audit** | Static analysis of source and tests, finding uncovered branches and boundaries | Want to know "what cases aren't tested yet" |
 | **advisor_analysis** | Two-stage strategic help: mid-tier model drafts first, escalates to strong model only when uncertain | Use cheap models as baseline, escalate to strong model at critical points |

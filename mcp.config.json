@@ -9,7 +9,8 @@
         "--directory",
         "d:\\AgentParliament",
         "agent-parliament"
-      ]
+      ],
+      "timeoutMs": 600000
     }
   }
 }

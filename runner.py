@@ -21,6 +21,7 @@ import shutil
 import atexit
 import signal
 import json
+import re
 import time
 import sys
 import os
@@ -289,12 +290,27 @@ def _resolve_claude_executable() -> str:
     return raw
 
 def _safe_int(value) -> int | None:
-    """ 把 usage 里的 token 字段安全转成 int，非数字/缺失返回 None """
+    """ 把 usage 里的 token 字段安全转成 int，非数字/缺失/布尔返回 None """
+    # bool 是 int 子类（int(True)==1），但语义上布尔不是 token 数量，必须显式拒绝
+    if isinstance(value, bool):
+        return None
     try:
         n = int(value)
         return n if n >= 0 else None
     except (TypeError, ValueError):
         return None
+
+# 脱敏正则：匹配常见 API key 前缀（sk-...）和 Authorization Bearer 头
+# 用于清理要写进 AttemptResult.error 对外暴露的响应体片段，避免网关回显请求头导致 token 泄漏
+# 已知盲区：仅覆盖 sk- 前缀和 Bearer 格式，非 sk- 格式的裸 token（如 GLM 的 JWT）不匹配；
+#           完整覆盖需高熵字符串检测，当前按"已知常见格式"保守处理
+_SECRET_PATTERN = re.compile(
+    r"(sk-[a-zA-Z0-9_\-]{8,}|[Bb]earer\s+[a-zA-Z0-9._\-]{8,})",
+)
+
+def _redact_secrets(text: str) -> str:
+    """ 把响应体里形似密钥/Bearer token 的片段脱敏，避免网关回显请求头导致 token 泄漏到错误信息 """
+    return _SECRET_PATTERN.sub("***REDACTED***", text or "")
 
 def _parse_cli_json(
     stdout: str | None,
@@ -961,19 +977,31 @@ class APIRunner(BaseRunner):
         # 解析响应
         error_type = _classify_api_error(resp.status_code, resp)
         if resp.status_code != 200:
-            body_snippet = resp.text[:500] if resp.text else ""
+            # 脱敏后再写入 error：网关可能回显请求头（含 Authorization/x-api-key），直接截取会泄漏 token
+            body_snippet = _redact_secrets(resp.text[:500]) if resp.text else ""
             return AttemptResult(
                 model_name=profile.name, ok=False,
                 error=f"API返回 HTTP {resp.status_code}：{body_snippet}",
                 error_type=error_type,
             )
 
+        # 200 但非 JSON（网关/CDN 返回 HTML 错误页等）：给明确错误，附响应体片段（脱敏后）
+        # 归"未知错误"不熔断是刻意的--200+HTML 更可能是临时 CDN 拦截而非"模型不可用"
+        content_type = resp.headers.get("content-type", "")
+        if "json" not in content_type.lower():
+            return AttemptResult(
+                model_name=profile.name, ok=False,
+                error=f"API返回非JSON内容（Content-Type={content_type}）：{_redact_secrets(resp.text[:300])}",
+                error_type="未知错误",
+            )
+
         try:
             data = resp.json()
         except Exception as exc:
+            # JSON 解析失败时附响应体片段（脱敏后），给排查线索
             return AttemptResult(
                 model_name=profile.name, ok=False,
-                error=f"API响应非合法JSON：{exc}",
+                error=f"API响应非合法JSON：{exc}；响应体片段：{_redact_secrets(resp.text[:300])}",
                 error_type="未知错误",
             )
 
@@ -1023,7 +1051,13 @@ def _classify_api_error(status_code: int, resp) -> str:
     """
     把 HTTP 状态码分类为与 _classify_error 一致的 error_type 字符串，
     使 APIRunner 的错误能无缝接入现有熔断器（认鉴权失败/额度限流/模型ID无效/网络连接）。
+
+    分类策略：状态码优先匹配标准场景；对未识别状态码（400/500/402 等）
+    回落检查响应体关键词--保守匹配，只在命中明确关键词时归类，否则保持"未知错误"，
+    避免把偶发错误误判成"模型不可用"而错误熔断一个健康模型。
+    保守原则：宁可漏判不可误判，因为误熔断一个健康模型的代价（冷却 300s 不用）比漏判更大。
     """
+    # 1. 状态码优先（标准场景，高置信）
     if status_code in (401, 403):
         return "鉴权失败"
     if status_code == 429:
@@ -1032,6 +1066,34 @@ def _classify_api_error(status_code: int, resp) -> str:
         return "模型ID无效"
     if status_code in (502, 503, 504):
         return "网络连接"
+
+    # 2. 未识别状态码：保守回落检查响应体关键词
+    # 很多第三方网关用 400 而非 404 表示模型 ID 无效，用 402 表示余额不足
+    body = ""
+    try:
+        body = (resp.text or "")[:500].lower()
+    except Exception:
+        body = ""
+
+    # 模型ID无效（很多网关用 400 而非 404）--要求 model + 明确的"找不到/不可用"措辞
+    if "model" in body and (
+        "not found" in body or "does not exist" in body or "not supported" in body
+        or "not available" in body
+    ):
+        return "模型ID无效"
+    # 鉴权失败（部分网关用 400/402 表示）--要求 unauthorized 搭配凭据关键词，避免误匹配权限/额度错误
+    if "api key" in body or "authentication" in body:
+        return "鉴权失败"
+    if "unauthorized" in body and ("key" in body or "token" in body or "credential" in body):
+        return "鉴权失败"
+    # 额度/限流
+    if "quota" in body or "rate limit" in body or "insufficient balance" in body or "too many requests" in body:
+        return "额度/限流"
+    # 服务端故障（5xx 未被上面精确匹配的，如 500）
+    if status_code >= 500:
+        return "网络连接"
+
+    # 命中不了任何明确关键词：保持"未知错误"（不熔断，宁可漏判不可误判）
     return "未知错误"
 
 
