@@ -237,22 +237,25 @@ cp profiles.example.json profiles.json
 
 ## 配合 agent-parliament plugin 使用（推荐）
 
-AgentParliament 是 MCP 工具；要发挥最大价值，推荐配合独立的 **agent-parliament plugin**——它包含一个 orchestrator 调度总纲 + 五个分工角色的 skill，在不同开发阶段介入，指导何时调用哪个工具：
+AgentParliament 是 MCP 工具；要发挥最大价值，推荐配合独立的 **agent-parliament plugin**——它包含一个 orchestrator 调度总纲 + 六个分工角色的 skill，在不同开发阶段介入，指导何时调用哪个工具：
 
 | Skill | 立场 | 介入阶段 | 主力工具 |
 |---|---|---|---|
 | `orchestrator` | 路由 | 不确定用哪个角色时 | （调度层，不直接调工具） |
-| `project-planner` | 想清楚 | 动工前需求/调研/架构 | `delegate_research`、`validate_approach`、`consensus` |
+| `project-planner` | 想清楚 | 动工前需求/调研/架构；创建/修订实施计划 | `delegate_research`、`validate_approach`、`consensus` |
+| `adversary` | 攻方案（外部） | 方案定稿前对抗打磨 SPEC/PLAN | `validate_approach`、`peer_review`、`independent_analysis` |
 | `code-developer` | 造 | 方案落地、改 bug | `peer_review`、`test_audit`、`delegate_research` |
-| `tester` | 攻（外部） | 高风险产出交付前 | `verify_implementation`、`peer_review`、`independent_analysis` |
-| `untangler` | 看清 | 卡住、方向混沌 | `independent_analysis`、`consensus` |
+| `reviewer` | 审实施（外部） | 实现完成后全面复盘、决定小修或二次方案 | `verify_implementation`、`peer_review`、`test_audit` |
+| `untangler` | 看清 | 卡住、方向混沌 | `independent_analysis`、`validate_approach` |
 | `memory-keeper` | 守 | 阶段归档、文档不一致 | `delegate_research`、`independent_analysis` |
 
-> **tester 与 code-developer 构成"构建-验证"闭环**：developer 交付前用 peer_review 自审自己的 diff，tester 从外部用同样的工具攻击别人的 diff——调用主体变了，确认偏差就被打破。tester 内化了分层攻击清单、稳态假设、Mutation 视角，且不修复（修复回流 developer）。
+> **adversary 与 reviewer 是两个不同时机的红队分层**：adversary 在**方案定稿前**攻方案层（SPEC/PLAN，无代码），小问题回流 planner，草案期大问题可直接改原始计划；reviewer 在**实现完成后**审实施层（代码 + 实际改动），小问题交 developer 修、大问题产出后继 PLAN 作二次方案。**代码修复永远回 code-developer**——adversary 和 reviewer 都不写代码。
 
 plugin 的 skill 定义"遇到这种情况调哪个工具"（调度指南），角色人格由各客户端的 subagent 配置定义。两者配合。共享铁律：**MCP 工具用来交叉验证，不替代自己思考——先有自己的结论，再用工具印证或证伪。**
 
 > 这套角色分工是可选的。你也可以在任意支持 MCP 的客户端里直接调用这 10 个工具。
+
+> **命名澄清**：MCP 工具的 `role` 参数（如 `peer_review(role="reviewer")`）是 `profiles.json` 里的**模型失败链名称**（一组按优先级尝试的模型），与 plugin 的 skill 角色名（如 `reviewer` skill）是**两个不同命名空间**，不强制对应。名字相同纯属巧合——MCP 的 `reviewer` 指一条模型链，plugin 的 `reviewer` 指实施后复盘的人格角色。
 
 ---
 

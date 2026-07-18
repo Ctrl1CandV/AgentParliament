@@ -1,6 +1,6 @@
 [project]
 name = "agent-parliament"
-version = "1.7.1"
+version = "1.7.2"
 description = "一个 MCP 服务：通过三级能力阶梯（Tier 0 纯文本融合 / Tier 1 只读探索 / Tier 2 隔离可写可执行）让主 Agent 调用多个国内外模型做调研、代码审查、独立分析与多模型共识。"
 requires-python = ">=3.10"
 dependencies = [

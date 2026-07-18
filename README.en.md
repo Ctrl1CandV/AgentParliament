@@ -237,22 +237,25 @@ Use test_audit to analyze the test coverage of runner.py
 
 ## Using with the agent-parliament plugin (recommended)
 
-AgentParliament is an MCP tool; for maximum value, pair it with the standalone **agent-parliament plugin** — it contains an orchestrator dispatch guide + five role skills that intervene at different development stages, guiding which tool to call when:
+AgentParliament is an MCP tool; for maximum value, pair it with the standalone **agent-parliament plugin** — it contains an orchestrator dispatch guide + six role skills that intervene at different development stages, guiding which tool to call when:
 
 | Skill | Stance | When to intervene | Primary tools |
 |---|---|---|---|
 | `orchestrator` | Routing | When unsure which role to use | (dispatch layer, doesn't call tools directly) |
-| `project-planner` | Think clearly | Pre-build requirements/research/architecture | `delegate_research`, `validate_approach`, `consensus` |
+| `project-planner` | Think clearly | Pre-build requirements/research/architecture; create/revise implementation plans | `delegate_research`, `validate_approach`, `consensus` |
+| `adversary` | Attack the plan (external) | Adversarially refine SPEC/PLAN before the plan is finalized | `validate_approach`, `peer_review`, `independent_analysis` |
 | `code-developer` | Build | Turning plans into code, fixing bugs | `peer_review`, `test_audit`, `delegate_research` |
-| `tester` | Attack (external) | Before high-risk deliverables | `verify_implementation`, `peer_review`, `independent_analysis` |
-| `untangler` | See clearly | Stuck, direction unclear | `independent_analysis`, `consensus` |
+| `reviewer` | Review the implementation (external) | Comprehensive review after implementation, decide minor fix or new plan | `verify_implementation`, `peer_review`, `test_audit` |
+| `untangler` | See clearly | Stuck, direction unclear | `independent_analysis`, `validate_approach` |
 | `memory-keeper` | Guard | Stage archival, doc-code inconsistency | `delegate_research`, `independent_analysis` |
 
-> **tester and code-developer form a "build-verify" loop**: developer self-reviews their own diff with peer_review before delivery; tester attacks someone else's diff with the same tool — the caller changed, so confirmation bias is broken. tester internalizes layered attack checklists, steady-state hypotheses, and Mutation thinking, and never fixes (fixes flow back to developer).
+> **adversary and reviewer are two red-team layers at different times**: adversary attacks the **plan layer** (SPEC/PLAN, no code yet) **before the plan is finalized** — minor issues flow back to planner, major issues in the draft phase can directly modify the original plan; reviewer reviews the **implementation layer** (code + actual changes) **after implementation** — minor issues go to developer for fixing, major issues produce a successor PLAN as a second-round proposal. **Code fixes always flow back to code-developer** — neither adversary nor reviewer writes code.
 
 The plugin's skills define "which tool to call when" (dispatch guide); role personas are defined by each client's subagent config. They work together. Shared iron rule: **MCP tools are for cross-validation, not replacing thinking — form your own conclusion first, then use tools to confirm or falsify.**
 
 > This role division is optional. You can also directly call the 10 tools in any MCP-compatible client.
+
+> **Naming clarification**: The `role` parameter of MCP tools (e.g. `peer_review(role="reviewer")`) is a **model failure-chain name** in `profiles.json` (a list of models tried in priority order), and is **a different namespace** from the plugin's skill role names (e.g. the `reviewer` skill). The name collision is coincidental — MCP's `reviewer` refers to a model chain, plugin's `reviewer` refers to the post-implementation review persona.
 
 ---
 
